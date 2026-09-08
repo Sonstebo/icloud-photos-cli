@@ -31,6 +31,17 @@ queries embed their text on the CPU so they never compete with a running
 index worker. Nothing else changes:
 embeddings from either path compare at cosine 1.0000.
 
+## Browsing with lap
+
+[lap](https://github.com/julyx10/lap) is an open-source desktop photo manager
+(Tauri, local AI, map, faces, editor). `photos lap-export` writes the
+catalogue into a lap library: one album of symlinks under the cache, rows with
+dates, GPS, favourites and captions, our thumbnails, our CLIP vectors (lap uses
+the same ViT-B/32 weights, so its semantic search runs on them), people, faces
+and collections. Run lap once so it creates its library, export, restart lap.
+Photos whose preview is not cached show their thumbnail but cannot open until
+fetched.
+
 ## Install
 
 ```sh
@@ -84,6 +95,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `collection list\|create\|delete\|add\|remove\|show` | ordered sets of ids for a project | no |
 | `people [--all]` | people from iCloud's People album, with photos found per person | no |
 | `index [--limit N] [--seed] [--rematch] [--threshold T] [--fetch-models] [--background]` | CLIP embeddings and faces | yes |
+| `lap-export [--library P] [--root P] [--limit N]` | write the catalogue into a [lap](https://github.com/julyx10/lap) library for browsing | no |
 | `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
 | `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute` | no |
 

@@ -650,3 +650,54 @@ class ComputeTests(unittest.TestCase):
             with self.assertRaises(ComputeUnavailable):
                 resolve_compute("gpu")
 
+
+
+class LapExportTests(unittest.TestCase):
+    """The export is checked against lap's real schema (tests/fixtures/lap_schema.sql)."""
+
+    def setUp(self):
+        self.base = IndexTests() if "IndexTests" in globals() else None
+
+    def test_export_writes_files_thumbs_embeddings_faces_and_collections(self):
+        import sqlite3
+        case = [c for c in globals().values() if isinstance(c, type) and issubclass(c, unittest.TestCase)
+                and hasattr(c, "run_ix") and hasattr(c, "with_models")][0]
+        t = case("test_index_seeds_people_embeds_images_and_names_faces")
+        t.setUp()
+        try:
+            t.test_index_seeds_people_embeds_images_and_names_faces()
+            models, _ = t.with_models()
+            t.j("collection", "create", "book")
+            first = t.j("search", "--limit", "1")[0]["results"][0]["id"]
+            t.j("collection", "add", "book", first)
+            lap_db = Path(t.tmp.name) / "lap.db"
+            con = sqlite3.connect(lap_db)
+            con.executescript(Path(__file__).with_name("fixtures").joinpath("lap_schema.sql").read_text())
+            con.close()
+            root = Path(t.tmp.name) / "lap-root"
+            r, _ = t.run_ix("lap-export", "--library", str(lap_db), "--root", str(root), models=models)
+            con = sqlite3.connect(lap_db)
+            files = con.execute("SELECT COUNT(*) FROM afiles").fetchone()[0]
+            self.assertEqual(files, r["files"])
+            self.assertGreater(files, 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM afiles WHERE embeds IS NOT NULL").fetchone()[0], r["embeddings"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM athumbs").fetchone()[0], r["thumbs"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM faces").fetchone()[0], r["faces"])
+            self.assertGreater(r["faces"], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM persons").fetchone()[0], r["people"])
+            self.assertTrue(con.execute("SELECT COUNT(*) FROM persons WHERE cover_face_id IS NOT NULL").fetchone()[0] >= 1)
+            self.assertEqual(con.execute("SELECT name FROM acollections").fetchone()[0], "book")
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM acollections_files").fetchone()[0], 1)
+            album = con.execute("SELECT path, total FROM albums").fetchone()
+            self.assertEqual((album[0], album[1]), (str(root), files))
+            links = [p for p in root.rglob("*") if p.is_symlink()]
+            self.assertEqual(len(links), r["linked"])
+            bbox = json.loads(con.execute("SELECT bbox FROM faces LIMIT 1").fetchone()[0])
+            self.assertEqual(set(bbox), {"x", "y", "width", "height", "confidence"})
+            # idempotent: a second run changes no counts
+            r2, _ = t.run_ix("lap-export", "--library", str(lap_db), "--root", str(root), models=models)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM afiles").fetchone()[0], files)
+            self.assertEqual(r2["files"], r["files"])
+            con.close()
+        finally:
+            t.tearDown()

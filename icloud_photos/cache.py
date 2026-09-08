@@ -47,6 +47,15 @@ class Cache:
         self.catalog.cache_touch(asset_id, version)
         return path
 
+    def peek(self, asset_id: str, version: str) -> Path | None:
+        """The cached file if it is on disk, without touching its use time or the
+        catalogue: safe while an index worker holds the write lock."""
+        row = self.catalog.cache_get(asset_id, version)
+        if row is None:
+            return None
+        path = Path(row["path"])
+        return path if path.exists() else None
+
     def put(self, asset_id: str, version: str, data: bytes, ext: str, pinned: bool = False) -> Path:
         size = len(data)
         self.make_room(size, keep=(asset_id, version))

@@ -26,6 +26,7 @@ from .catalog import Catalog
 from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
 from . import index as indexing
+from . import lap as lap_export
 from .ml import COMPUTE_MODES, ComputeUnavailable, ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob
 
 EXT_BY_TYPE = {
@@ -315,6 +316,29 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
     app.emit(result, lambda r: f"sync {r['mode']}: {r['records']} records; assets new {r['new']}, changed {r['changed']}, "
                                f"missing {r['missing']}; relations {r['relations']}, people {r['people']}, "
                                f"face crops {r['face_crops']}, albums {r['albums']}")
+    return 0
+
+
+def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
+    library = Path(args.library) if args.library else lap_export.default_library()
+    if library is None or not library.exists():
+        raise CliError("lap-missing", "no lap library found; run lap once (https://github.com/julyx10/lap) or pass --library PATH")
+    root = Path(args.root) if args.root else app.paths.cache_dir / "lap"
+    try:
+        lib = lap_export.LapLibrary(library, root, thumb_size=args.thumb_size)
+    except ValueError as err:
+        raise CliError("lap-invalid", str(err)) from err
+
+    def progress(p: dict[str, Any]) -> None:
+        if not app.json:
+            print(f"  {p['done']} of {p['total']}: {p['files']} files, {p['thumbs']} thumbs, {p['faces']} faces", file=sys.stderr)
+    try:
+        result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, progress=progress)
+    finally:
+        lib.close()
+    app.emit(result, lambda r: f"lap library {r['library']}: {r['files']} files ({r['linked']} with a cached file), "
+                               f"{r['thumbs']} thumbnails, {r['embeddings']} embeddings, {r['faces']} faces of {r['people']} people, "
+                               f"{r['collections']} collections; restart lap to see them")
     return 0
 
 
@@ -700,6 +724,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--fetch-models", action="store_true", help="download the CLIP model files (~600 MB) and exit")
     s.add_argument("--background", action="store_true", help="run detached; follow with `photos status`")
     s.set_defaults(fn=cmd_index)
+
+    s = sub.add_parser("lap-export", help="write the catalogue into a lap library so lap can browse it",
+                       description="Writes files, thumbnails, CLIP embeddings, people, faces and collections into a lap "
+                                   "library database (https://github.com/julyx10/lap), as one album rooted at a tree of "
+                                   "symlinks under the cache. Idempotent; lap needs a restart to show the changes.")
+    s.add_argument("--library", help="lap library database (default: lap's default library)")
+    s.add_argument("--root", help="album root for the symlink tree (default: <cache>/lap)")
+    s.add_argument("--thumb-size", type=int, default=200, help="thumbnail size lap expects (default 200)")
+    s.add_argument("--limit", type=int, help="export only the newest N assets")
+    s.set_defaults(fn=cmd_lap_export)
 
     s = sub.add_parser("faces", help="faces found in photos; assign or clear a person")
     fs = s.add_subparsers(dest="faces_cmd", metavar="action", required=True)
