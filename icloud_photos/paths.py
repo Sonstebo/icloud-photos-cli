@@ -17,6 +17,7 @@ DEFAULTS = {
     "cache_budget_mb": 2048,   # previews + originals together
     "username": "",            # Apple ID; empty means "the one session in session_dir"
     "preview_size": "thumb",   # what `show` fetches by default: thumb or medium
+    "face_threshold": 0.5,     # cosine similarity for naming a face from a person's seeds
 }
 
 
@@ -64,6 +65,18 @@ class Paths:
         return self.state_dir / "session"
 
     @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
+    def index_lock(self) -> Path:
+        return self.state_dir / "index.lock"
+
+    @property
+    def index_log(self) -> Path:
+        return self.state_dir / "index.log"
+
+    @property
     def sync_lock(self) -> Path:
         return self.state_dir / "sync.lock"
 
@@ -104,6 +117,8 @@ class Config:
             self.values[key] = raw.lower() in ("1", "true", "yes", "on")
         elif isinstance(current, int):
             self.values[key] = int(raw)
+        elif isinstance(current, float):
+            self.values[key] = float(raw)
         else:
             self.values[key] = raw
 

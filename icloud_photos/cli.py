@@ -23,6 +23,8 @@ from .cache import BudgetExceeded, Cache
 from .catalog import Catalog
 from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
+from . import index as indexing
+from .ml import ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob
 
 EXT_BY_TYPE = {
     "public.jpeg": ".jpg", "public.heic": ".heic", "public.heif": ".heif", "public.png": ".png",
@@ -44,8 +46,11 @@ class CliError(Exception):
 class App:
     """Everything a command needs, opened lazily so `--help` costs nothing."""
 
-    def __init__(self, json_mode: bool, adapter_factory: Callable[["App"], Adapter] | None = None) -> None:
+    def __init__(self, json_mode: bool, adapter_factory: Callable[["App"], Adapter] | None = None,
+                 models_factory: Callable[["App"], Any] | None = None) -> None:
         self.json = json_mode
+        self._models: Any = None
+        self._models_factory = models_factory or (lambda app: OnnxModels(app.paths.models_dir))
         self.paths = Paths.discover().ensure()
         self.config = Config.load(self.paths.config_file)
         self._catalog: Catalog | None = None
@@ -65,6 +70,12 @@ class App:
         if self._cache is None:
             self._cache = Cache(self.paths.cache_dir, self.catalog, self.config.cache_budget_bytes)
         return self._cache
+
+    @property
+    def models(self) -> Any:
+        if self._models is None:
+            self._models = self._models_factory(self)
+        return self._models
 
     @property
     def adapter(self) -> Adapter:
@@ -170,6 +181,8 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
         "sync_running": _sync_pid(app) is not None,
         "sync_progress": json.loads(progress) if progress else None,
         "cache": app.cache.usage(),
+        "index": app.catalog.index_counts() | {"running": _pid(app.paths.index_lock) is not None,
+                                                "progress": json.loads(ip) if (ip := app.catalog.get_meta("index_progress")) else None},
         "paths": {"catalog": str(app.paths.catalog_db), "cache": str(app.paths.cache_dir),
                   "session": str(app.paths.session_dir), "config": str(app.paths.config_file)},
     }
@@ -192,6 +205,9 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
             lines.append("last sync: never (run `photos sync`)")
         if p["sync_running"]:
             lines.append(f"sync:     running {p['sync_progress'] or ''}")
+        ix = p["index"]
+        lines.append(f"index:    {ix['indexed']} of {ix['images']} images; {ix['faces']} faces, {ix['faces_named']} named; "
+                     f"{ix['seeds']} seeds for {ix['seeded_people']} people" + (f"; running {ix['progress']}" if ix["running"] else ""))
         return "\n".join(lines)
 
     app.emit(payload, text)
@@ -199,7 +215,10 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
 
 
 def _sync_pid(app: App) -> int | None:
-    lock = app.paths.sync_lock
+    return _pid(app.paths.sync_lock)
+
+
+def _pid(lock: Path) -> int | None:
     if not lock.exists():
         return None
     try:
@@ -241,10 +260,105 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
 
 def cmd_people(app: App, args: argparse.Namespace) -> int:
     rows = app.catalog.people()
+    photos = app.catalog.person_photo_counts()
+    for r in rows:
+        r["photos"] = photos.get(r["id"], 0)
+    if not args.all:
+        rows = [r for r in rows if r["name"] or r["photos"]]
     app.emit(rows, lambda rs: "\n".join(
-        f"{r['face_crops']:>4}  {r['name'] or '(unnamed)'}" + (f"  ({r['display_name']})" if r['display_name'] and r['display_name'] != r['name'] else "")
+        f"{r['photos']:>6} photos {r['face_crops']:>3} crops  {r['name'] or '(unnamed)'}"
+        + (f"  ({r['display_name']})" if r['display_name'] and r['display_name'] != r['name'] else "")
         + ("" if r['verified'] else "  unverified") + f"  {r['id']}" for r in rs)
         or "no people in the catalogue yet; run `photos sync`")
+    return 0
+
+
+def cmd_index(app: App, args: argparse.Namespace) -> int:
+    if args.fetch_models:
+        fetch_clip_models(app.paths.models_dir, report=lambda m: print(m, file=sys.stderr))
+        app.emit({"models": str(app.paths.models_dir)}, lambda p: f"models under {p['models']}")
+        return 0
+    if (pid := _pid(app.paths.index_lock)) is not None:
+        raise CliError("index-running", f"an index run is already going (pid {pid}); see `photos status`")
+    if args.background:
+        flags = [f for f, on in (("--seed", args.seed), ("--rematch", args.rematch)) if on]
+        if args.limit:
+            flags += ["--limit", str(args.limit)]
+        if args.threshold is not None:
+            flags += ["--threshold", str(args.threshold)]
+        log = app.paths.index_log.open("ab")
+        proc = subprocess.Popen([sys.executable, "-m", "icloud_photos", "--json", "index", *flags],
+                                stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        app.emit({"started": True, "pid": proc.pid, "log": str(app.paths.index_log)},
+                 lambda p: f"index started in the background (pid {p['pid']}), log at {p['log']}; watch with `photos status`")
+        return 0
+    threshold = args.threshold if args.threshold is not None else float(app.config.values.get("face_threshold", indexing.DEFAULT_THRESHOLD))
+    app.paths.index_lock.write_text(str(os.getpid()))
+    out: dict[str, Any] = {}
+    try:
+        def progress(p: dict[str, Any]) -> None:
+            if not app.json:
+                print("  " + " ".join(f"{k} {v}" for k, v in p.items() if isinstance(v, int)), file=sys.stderr)
+        try:
+            if args.seed or not app.catalog.seeds():
+                out["seed"] = indexing.seed_people(app.catalog, app.adapter, app.models, progress=progress)
+            if args.rematch:
+                out["rematch"] = indexing.rematch(app.catalog, threshold)
+            else:
+                out["index"] = indexing.index(app.catalog, app.adapter, app.cache, app.models, limit=args.limit,
+                                              threshold=threshold, progress=progress)
+        except ModelsMissing as err:
+            raise CliError("models-missing", str(err), 5) from err
+    finally:
+        app.paths.index_lock.unlink(missing_ok=True)
+
+    def text(o: dict[str, Any]) -> str:
+        lines = []
+        if "seed" in o:
+            sd = o["seed"]; lines.append(f"seeds: {sd['seeded']} embedded from {sd['crops']} face crops ({sd['no_face']} without a face, {sd['failed']} failed)")
+        if "rematch" in o:
+            lines.append(f"rematch: {o['rematch']['changed']} of {o['rematch']['faces']} faces changed")
+        if "index" in o:
+            ix = o["index"]; lines.append(f"index: {ix['done']} of {ix['todo']} images ({ix['source']}); {ix['faces']} faces, {ix['named']} matched to a person; {ix['failed']} failed")
+        return "\n".join(lines)
+    app.emit(out, text)
+    return 0
+
+
+def cmd_faces(app: App, args: argparse.Namespace) -> int:
+    c = app.catalog
+    if args.faces_cmd == "show":
+        rows = []
+        for asset in _assets(app, args.id):
+            rows += c.faces_of(asset["id"])
+        app.emit(rows, lambda rs: "\n".join(
+            f"face {f['id']:>7}  {f['asset_id']}  box {f['box']}  det {f['det']:.2f}  "
+            + (f"{f['person_name'] or f['person_id']} ({f['similarity']:.2f}, {f['assigned']})" if f['person_id'] else
+               (f"unassigned (best {f['similarity']:.2f})" if f['similarity'] is not None else "unassigned"))
+            for f in rs) or "no faces recorded; is it indexed?")
+    elif args.faces_cmd == "assign":
+        face = c.get_face(args.face_id)
+        if face is None:
+            raise CliError("unknown-face", f"no face {args.face_id}")
+        person = _person_id(app, args.person)
+        c.assign_face(face["id"], person, None, "user")
+        # a confirmed face is the best seed there is
+        c.put_seed(f"face:{face['id']}", person, face["embedding"], face["det"], "user")
+        app.emit({"face": face["id"], "person": person}, lambda r: f"face {r['face']} -> {args.person}; it now seeds that person")
+    elif args.faces_cmd == "unassign":
+        face = c.get_face(args.face_id)
+        if face is None:
+            raise CliError("unknown-face", f"no face {args.face_id}")
+        c.assign_face(face["id"], None, None, "user-cleared")
+        c.db.execute("DELETE FROM person_seeds WHERE id=?", (f"face:{face['id']}",))
+        app.emit({"face": face["id"], "person": None}, lambda r: f"face {r['face']} unassigned")
+    elif args.faces_cmd == "unassigned":
+        rows = [dict(r) for r in c.db.execute(
+            "SELECT f.id, f.asset_id, f.det, f.similarity, a.taken, a.filename FROM faces f JOIN assets a ON a.id=f.asset_id "
+            "WHERE f.person_id IS NULL AND f.det >= ? ORDER BY f.similarity DESC LIMIT ?", (args.min_det, args.limit))]
+        app.emit(rows, lambda rs: "\n".join(
+            f"face {r['id']:>7}  {r['asset_id']}  {(r['taken'] or '')[:10]}  det {r['det']:.2f}  best {r['similarity'] if r['similarity'] is None else round(r['similarity'], 2)}  {r['filename']}"
+            for r in rs) or "none")
     return 0
 
 
@@ -255,18 +369,55 @@ def cmd_albums(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def _person_id(app: App, key: str | None) -> str | None:
+    if not key:
+        return None
+    person = app.catalog.find_person(key)
+    if person is None:
+        raise CliError("unknown-person", f"no person {key!r}; see `photos people`")
+    return person["id"]
+
+
 def cmd_search(app: App, args: argparse.Namespace) -> int:
     fav = True if args.favorite else (False if args.not_favorite else None)
-    rows, next_cursor = app.catalog.search(
-        text=args.query, since=parse_date(args.since), until=parse_date(args.until, end=True),
+    filters = dict(
+        since=parse_date(args.since), until=parse_date(args.until, end=True),
         kind=args.kind, favorite=fav, album=args.album, collection=args.collection,
+        person=_person_id(app, args.person),
         located=True if args.located else None, live=True if args.live else None,
-        include_missing=args.include_missing, include_hidden=args.include_hidden,
-        limit=args.limit, cursor=args.cursor)
-    payload = {"results": rows, "count": len(rows), "next_cursor": next_cursor}
+        include_missing=args.include_missing, include_hidden=args.include_hidden)
+    if args.semantic or args.similar:
+        if not app.catalog.vec:
+            raise CliError("no-vector-search", "sqlite-vec is not available, so there is no semantic search")
+        if args.cursor:
+            raise CliError("no-cursor", "semantic results are ranked by score, not paged; raise --limit instead")
+        if args.similar:
+            q = app.catalog.clip_of(args.similar)
+            if q is None:
+                raise CliError("not-indexed", f"{args.similar} has no embedding yet; run `photos index`")
+        else:
+            if not args.query:
+                raise CliError("no-query", "--semantic needs a query, e.g. `photos search --semantic \"a beach at sunset\"`")
+            try:
+                q = as_blob(app.models.embed_text(args.query))
+            except ModelsMissing as err:
+                raise CliError("models-missing", str(err), 5) from err
+        # over-fetch, then apply the metadata filters and keep the order by score
+        nearest = app.catalog.nearest_clip(q, max(args.limit * 8, 200))
+        score = {aid: 1 - d * d / 2 for aid, d in nearest}       # L2 on unit vectors -> cosine
+        rows, _ = app.catalog.search(ids=list(score), limit=len(score) or 1, **filters)
+        rows.sort(key=lambda a: -score[a["id"]])
+        rows = rows[:args.limit]
+        for a in rows:
+            a["score"] = round(score[a["id"]], 4)
+        payload = {"results": rows, "count": len(rows), "next_cursor": None,
+                   "query": args.query if args.semantic else f"similar to {args.similar}"}
+    else:
+        rows, next_cursor = app.catalog.search(text=args.query, limit=args.limit, cursor=args.cursor, **filters)
+        payload = {"results": rows, "count": len(rows), "next_cursor": next_cursor}
 
     def text(p: dict[str, Any]) -> str:
-        lines = [asset_line(a) for a in p["results"]] or ["no matches"]
+        lines = [(f"{a['score']:.3f}  " if "score" in a else "") + asset_line(a) for a in p["results"]] or ["no matches"]
         if p["next_cursor"]:
             lines.append(f"more: --cursor {p['next_cursor']}")
         return "\n".join(lines)
@@ -295,6 +446,7 @@ def cmd_info(app: App, args: argparse.Namespace) -> int:
             (a["id"],))]
         a["collections"] = [r["collection"] for r in app.catalog.db.execute(
             "SELECT collection FROM collection_assets WHERE asset_id=?", (a["id"],))]
+        a["faces"] = [{k: v for k, v in f.items() if k != "asset_id"} for f in app.catalog.faces_of(a["id"])]
     app.emit(rows if len(rows) > 1 else rows[0])
     return 0
 
@@ -432,7 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "without the network. Images are fetched on demand into a bounded cache; `show`\n"
                     "and `original` print the local path of the file they fetched. Asset ids are stable.\n"
                     "Add --json to any command for structured output; errors are one line on stderr\n"
-                    "with a non-zero exit (2 needs a terminal, 3 not logged in, 4 cache full).",
+                    "with a non-zero exit (2 needs a terminal, 3 not logged in, 4 cache full, 5 models missing).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="typical session:\n"
                "  photos login                      once, interactive (password + two-factor code)\n"
@@ -440,6 +592,8 @@ def build_parser() -> argparse.ArgumentParser:
                "  photos search beach --since 2019-07 --until 2019-08 --json\n"
                "  photos show <id> <id>             fetch small previews, print their paths\n"
                "  photos original <id> --pin        fetch the full file and keep it\n"
+               "  photos index --background        CLIP + faces for every image; then\n"
+               "  photos search --semantic \"kids on a beach\" --person Julie --since 2019\n"
                "  photos collection create book && photos collection add book <id>...\n")
     p.add_argument("--json", action="store_true", help="structured output on stdout; errors as JSON on stderr")
     p.add_argument("--version", action="version", version=f"photos {__version__}")
@@ -468,8 +622,32 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("albums", help="list albums known to the catalogue")
     s.set_defaults(fn=cmd_albums)
 
-    s = sub.add_parser("people", help="named people from iCloud's People album, with their face crop counts")
+    s = sub.add_parser("people", help="people from iCloud's People album, with photos where their face was found")
+    s.add_argument("--all", action="store_true", help="include unnamed people with no matched photos")
     s.set_defaults(fn=cmd_people)
+
+    s = sub.add_parser("index", help="embed images (CLIP) and find faces, matched to named people",
+                       description="Pass 1 runs on thumbnails: one CLIP embedding per image for `search --semantic` "
+                                   "and `--similar`, and every face with its match to a named person. The first run "
+                                   "seeds people from the face crops iCloud keeps for them. Resumable; run it detached "
+                                   "with --background and follow `photos status`.")
+    s.add_argument("--limit", type=int, metavar="N", help="index at most N images (newest first)")
+    s.add_argument("--seed", action="store_true", help="(re)build person seeds from iCloud face crops first")
+    s.add_argument("--rematch", action="store_true", help="only re-run person matching over known faces")
+    s.add_argument("--threshold", type=float, help="cosine similarity needed to name a face (config face_threshold, default 0.5)")
+    s.add_argument("--fetch-models", action="store_true", help="download the CLIP model files (~600 MB) and exit")
+    s.add_argument("--background", action="store_true", help="run detached; follow with `photos status`")
+    s.set_defaults(fn=cmd_index)
+
+    s = sub.add_parser("faces", help="faces found in photos; assign or clear a person")
+    fs = s.add_subparsers(dest="faces_cmd", metavar="action", required=True)
+    x = fs.add_parser("show", help="faces in the given assets"); x.add_argument("id", nargs="+")
+    x = fs.add_parser("assign", help="name a face; it becomes a seed for that person")
+    x.add_argument("face_id", type=int); x.add_argument("person", help="name, display name or id from `photos people`")
+    x = fs.add_parser("unassign"); x.add_argument("face_id", type=int)
+    x = fs.add_parser("unassigned", help="faces no person matched, most nearly matched first")
+    x.add_argument("--limit", type=int, default=30); x.add_argument("--min-det", type=float, default=0.7)
+    s.set_defaults(fn=cmd_faces)
 
     s = sub.add_parser("search", help="find assets in the catalogue (no network)",
                        description="Newest capture first. Results are paged: pass the printed cursor back "
@@ -480,6 +658,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--kind", choices=("image", "movie"))
     s.add_argument("--favorite", action="store_true"); s.add_argument("--not-favorite", action="store_true")
     s.add_argument("--album", metavar="NAME_OR_ID"); s.add_argument("--collection", metavar="NAME")
+    s.add_argument("--person", metavar="NAME_OR_ID", help="only photos where this person's face was found")
+    s.add_argument("--semantic", action="store_true", help="rank by meaning: the query describes the picture (CLIP)")
+    s.add_argument("--similar", metavar="ID", help="rank by visual similarity to this asset")
     s.add_argument("--located", action="store_true", help="only assets with GPS coordinates")
     s.add_argument("--live", action="store_true", help="only Live Photos")
     s.add_argument("--include-missing", action="store_true", help="also assets no longer in iCloud")
@@ -538,9 +719,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None, adapter_factory: Callable[[App], Adapter] | None = None) -> int:
+def main(argv: list[str] | None = None, adapter_factory: Callable[[App], Adapter] | None = None,
+         models_factory: Callable[[App], Any] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    app = App(args.json, adapter_factory)
+    app = App(args.json, adapter_factory, models_factory)
     signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         return args.fn(app, args)

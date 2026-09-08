@@ -9,6 +9,14 @@ description = "An assistant-friendly command line for an iCloud photo library: d
 requires-python = ">=3.11"
 dependencies = [
     "pyicloud[cli]>=2.7.0",
+    "numpy",
+    "onnxruntime>=1.20",
+    "insightface>=0.7",
+    "opencv-python-headless",
+    "tokenizers",
+    "sqlite-vec>=0.1.6",
+    "pillow",
+    "pillow-heif",
 ]
 
 [project.scripts]

@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS people (
 CREATE TABLE IF NOT EXISTS face_crops (
     id TEXT PRIMARY KEY, person_id TEXT, kind INTEGER, bytes INTEGER, modified TEXT, deleted INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS face_crops_person ON face_crops (person_id);
+CREATE TABLE IF NOT EXISTS index_state (
+    asset_id TEXT PRIMARY KEY, clip_model TEXT, face_model TEXT, source TEXT, indexed TEXT, faces INTEGER);
+CREATE TABLE IF NOT EXISTS faces (
+    id INTEGER PRIMARY KEY, asset_id TEXT, box TEXT, det REAL, age INTEGER, gender INTEGER,
+    embedding BLOB, source TEXT, person_id TEXT, similarity REAL, assigned TEXT);
+CREATE INDEX IF NOT EXISTS faces_asset ON faces (asset_id);
+CREATE INDEX IF NOT EXISTS faces_person ON faces (person_id);
+CREATE TABLE IF NOT EXISTS person_seeds (
+    id TEXT PRIMARY KEY, person_id TEXT, embedding BLOB, det REAL, origin TEXT, created TEXT);
+CREATE INDEX IF NOT EXISTS person_seeds_person ON person_seeds (person_id);
 CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, created TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS collection_assets (
     collection TEXT, asset_id TEXT, position INTEGER, note TEXT,
@@ -98,6 +108,23 @@ class Catalog:
         self.db.executescript(SCHEMA)
         if self.get_meta("schema") is None:
             self.set_meta("schema", str(SCHEMA_VERSION))
+        self.vec = self._load_vec()
+
+    def _load_vec(self) -> bool:
+        """sqlite-vec gives the catalogue nearest-neighbour search; without it, no semantic search."""
+        try:
+            import sqlite_vec
+        except ImportError:
+            return False
+        try:
+            self.db.enable_load_extension(True)
+            sqlite_vec.load(self.db)
+            self.db.enable_load_extension(False)
+        except (AttributeError, sqlite3.OperationalError):
+            return False
+        self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vec_clip USING vec0(asset_id TEXT PRIMARY KEY, e float[512])")
+        self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vec_face USING vec0(face_id INTEGER PRIMARY KEY, e float[512])")
+        return True
 
     def close(self) -> None:
         self.db.close()
@@ -261,6 +288,8 @@ class Catalog:
         favorite: bool | None = None,
         album: str | None = None,
         collection: str | None = None,
+        person: str | None = None,
+        ids: list[str] | None = None,
         located: bool | None = None,
         live: bool | None = None,
         include_missing: bool = False,
@@ -297,6 +326,12 @@ class Catalog:
         if collection:
             where.append("a.id IN (SELECT asset_id FROM collection_assets WHERE collection = ?)")
             args.append(collection)
+        if person:
+            where.append("a.id IN (SELECT asset_id FROM faces WHERE person_id = ?)")
+            args.append(person)
+        if ids is not None:
+            where.append(f"a.id IN ({','.join('?' * len(ids))})" if ids else "0")
+            args += ids
         if cursor:
             taken, asset_id = decode_cursor(cursor)
             # rows sort by (taken DESC, id DESC); NULL taken sorts last in DESC order
@@ -397,6 +432,110 @@ class Catalog:
         by_version = {r["version"]: {"files": r["n"], "bytes": r["b"]} for r in self.db.execute(
             "SELECT version, COUNT(*) n, COALESCE(SUM(bytes),0) b FROM cache GROUP BY version")}
         return {"files": row["n"], "bytes": row["b"], "pinned_bytes": row["p"], "by_version": by_version}
+
+    # --- index: clip embeddings, faces, seeds --------------------------------
+    def unindexed(self, clip_model: str, face_model: str, limit: int | None = None) -> list[dict[str, Any]]:
+        """Images not yet indexed with these models, newest first."""
+        sql = ("SELECT a.* FROM assets a LEFT JOIN index_state s ON s.asset_id = a.id "
+               "WHERE a.kind='image' AND a.missing_since IS NULL "
+               "AND (s.asset_id IS NULL OR s.clip_model IS NOT ? OR s.face_model IS NOT ?) "
+               "ORDER BY a.taken DESC, a.id DESC")
+        args: list[Any] = [clip_model, face_model]
+        if limit:
+            sql += " LIMIT ?"; args.append(limit)
+        return [self._asset_dict(r) for r in self.db.execute(sql, args)]
+
+    def put_clip(self, asset_id: str, embedding: bytes) -> None:
+        self.db.execute("DELETE FROM vec_clip WHERE asset_id=?", (asset_id,))
+        self.db.execute("INSERT INTO vec_clip (asset_id, e) VALUES (?, ?)", (asset_id, embedding))
+
+    def put_faces(self, asset_id: str, faces: list[dict[str, Any]], source: str) -> list[int]:
+        """Replace the automatically found faces of an asset; user-assigned ones are kept."""
+        for row in self.db.execute("SELECT id FROM faces WHERE asset_id=? AND (assigned IS NULL OR assigned='auto')", (asset_id,)):
+            self.db.execute("DELETE FROM vec_face WHERE face_id=?", (row["id"],))
+        self.db.execute("DELETE FROM faces WHERE asset_id=? AND (assigned IS NULL OR assigned='auto')", (asset_id,))
+        ids = []
+        for f in faces:
+            cur = self.db.execute(
+                "INSERT INTO faces (asset_id, box, det, age, gender, embedding, source, person_id, similarity, assigned) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (asset_id, json.dumps(f["box"]), f["det"], f.get("age"), f.get("gender"), f["embedding"], source,
+                 f.get("person_id"), f.get("similarity"), "auto" if f.get("person_id") else None))
+            ids.append(cur.lastrowid)
+            self.db.execute("INSERT INTO vec_face (face_id, e) VALUES (?, ?)", (cur.lastrowid, f["embedding"]))
+        return ids
+
+    def set_index_state(self, asset_id: str, clip_model: str | None, face_model: str | None, source: str, faces: int) -> None:
+        self.db.execute(
+            """INSERT INTO index_state (asset_id, clip_model, face_model, source, indexed, faces) VALUES (?,?,?,?,?,?)
+               ON CONFLICT(asset_id) DO UPDATE SET clip_model=COALESCE(excluded.clip_model, index_state.clip_model),
+                   face_model=COALESCE(excluded.face_model, index_state.face_model), source=excluded.source,
+                   indexed=excluded.indexed, faces=excluded.faces""",
+            (asset_id, clip_model, face_model, source, now(), faces))
+
+    def index_counts(self) -> dict[str, Any]:
+        q = self.db.execute
+        return {
+            "indexed": q("SELECT COUNT(*) FROM index_state").fetchone()[0],
+            "images": q("SELECT COUNT(*) FROM assets WHERE kind='image' AND missing_since IS NULL").fetchone()[0],
+            "faces": q("SELECT COUNT(*) FROM faces").fetchone()[0],
+            "faces_named": q("SELECT COUNT(*) FROM faces WHERE person_id IS NOT NULL").fetchone()[0],
+            "seeds": q("SELECT COUNT(*) FROM person_seeds").fetchone()[0],
+            "seeded_people": q("SELECT COUNT(DISTINCT person_id) FROM person_seeds").fetchone()[0],
+        }
+
+    def put_seed(self, seed_id: str, person_id: str, embedding: bytes, det: float | None, origin: str) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO person_seeds (id, person_id, embedding, det, origin, created) VALUES (?,?,?,?,?,?)",
+            (seed_id, person_id, embedding, det, origin, now()))
+
+    def seeds(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute("SELECT id, person_id, embedding, det, origin FROM person_seeds")]
+
+    def unseeded_crops(self, named_only: bool = True) -> list[dict[str, Any]]:
+        """Face crops of (named) people that have not been embedded as seeds yet."""
+        sql = ("SELECT f.id, f.person_id, f.bytes FROM face_crops f JOIN people p ON p.id = f.person_id "
+               "LEFT JOIN person_seeds s ON s.id = f.id WHERE f.deleted=0 AND p.deleted=0 AND s.id IS NULL")
+        if named_only:
+            sql += " AND p.name IS NOT NULL AND p.name <> ''"
+        return [dict(r) for r in self.db.execute(sql)]
+
+    def nearest_clip(self, embedding: bytes, limit: int) -> list[tuple[str, float]]:
+        return [(r["asset_id"], r["distance"]) for r in self.db.execute(
+            "SELECT asset_id, distance FROM vec_clip WHERE e MATCH ? ORDER BY distance LIMIT ?", (embedding, limit))]
+
+    def clip_of(self, asset_id: str) -> bytes | None:
+        row = self.db.execute("SELECT e FROM vec_clip WHERE asset_id=?", (asset_id,)).fetchone()
+        return bytes(row["e"]) if row else None
+
+    def faces_of(self, asset_id: str) -> list[dict[str, Any]]:
+        out = []
+        for r in self.db.execute(
+                "SELECT f.id, f.asset_id, f.box, f.det, f.age, f.gender, f.source, f.person_id, f.similarity, f.assigned, "
+                "p.name AS person_name FROM faces f LEFT JOIN people p ON p.id = f.person_id WHERE f.asset_id=? ORDER BY f.id",
+                (asset_id,)):
+            d = dict(r); d["box"] = json.loads(d["box"]); out.append(d)
+        return out
+
+    def get_face(self, face_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM faces WHERE id=?", (face_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row); d["box"] = json.loads(d["box"]); return d
+
+    def assign_face(self, face_id: int, person_id: str | None, similarity: float | None, how: str) -> None:
+        self.db.execute("UPDATE faces SET person_id=?, similarity=?, assigned=? WHERE id=?",
+                        (person_id, similarity, how if person_id else None, face_id))
+
+    def find_person(self, key: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM people WHERE deleted=0 AND (id=? OR name=? COLLATE NOCASE OR display_name=? COLLATE NOCASE)",
+            (key, key, key)).fetchone()
+        return dict(row) if row else None
+
+    def person_photo_counts(self) -> dict[str, int]:
+        return {r["person_id"]: r["n"] for r in self.db.execute(
+            "SELECT person_id, COUNT(DISTINCT asset_id) n FROM faces WHERE person_id IS NOT NULL GROUP BY person_id")}
 
     # --- collections ------------------------------------------------------
     def collection_create(self, name: str, note: str | None = None) -> bool:

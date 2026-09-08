@@ -57,17 +57,20 @@ systemctl --user enable --now icloud-photos-sync.timer
 | `status [--offline]` | auth state, catalogue counts, cache usage, sync progress | unless `--offline` |
 | `sync [--full] [--albums] [--limit N] [--background]` | update the catalogue | yes |
 | `albums` | albums in the catalogue with counts | no |
-| `search [TEXT] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first | no |
+| `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `info ID...` | every field, cached renditions, albums, collections | no |
 | `show ID... [--size thumb\|medium]` | fetch previews, print `id<TAB>path` | if not cached |
 | `original ID... [--pin] [--version V]` | fetch full files, print paths | if not cached |
 | `cache status\|verify\|pin\|unpin\|evict` | manage local copies; iCloud is never touched | no |
 | `collection list\|create\|delete\|add\|remove\|show` | ordered sets of ids for a project | no |
-| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size` | no |
+| `people [--all]` | people from iCloud's People album, with photos found per person | no |
+| `index [--limit N] [--seed] [--rematch] [--threshold T] [--fetch-models] [--background]` | CLIP embeddings and faces | yes |
+| `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
+| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
 includes the whole of the period given. Exit codes: 1 error, 2 needs a
-terminal, 3 not logged in, 4 cache full. With `--json`, errors are
+terminal, 3 not logged in, 4 cache full, 5 model files missing. With `--json`, errors are
 `{"error": code, "message": text}` on stderr.
 
 ## An assistant's session
@@ -87,6 +90,7 @@ photos cache evict --all                    # drop unpinned local copies; the ca
 | --- | --- |
 | catalogue | `~/.local/share/icloud-photos/catalog.db` |
 | cache | `~/.cache/icloud-photos/{thumb,medium,original,...}/` |
+| models | `~/.local/share/icloud-photos/models/` |
 | session (cookies, tokens) | `~/.local/state/icloud-photos/session/` (mode 700) |
 | config | `~/.config/icloud-photos/config.toml` |
 | background sync log and lock | `~/.local/state/icloud-photos/` |
@@ -103,13 +107,48 @@ fetch that would exceed `cache_budget_mb` first evicts the least recently
 used unpinned files and, if that is not enough, refuses with exit 4 and says
 what to do.
 
+## Meaning and faces
+
+`photos index` gives every image a CLIP embedding and finds the faces in it.
+The models are the ones Immich uses, run in-process: Immich's ONNX export of
+CLIP ViT-B-32 (from huggingface.co/immich-app/ViT-B-32__openai, fetched with
+`photos index --fetch-models`, about 600 MB) under onnxruntime, and
+InsightFace's buffalo_l pack (fetched on first use). CPU only, roughly 60 ms
+for the embedding and 300 ms for the faces of one thumbnail on an M1.
+
+```sh
+photos index --fetch-models
+photos index --background           # pass 1: every image from its thumbnail; resumable
+photos search --semantic "kids on a beach at sunset" --since 2019 --limit 10
+photos search --similar <id>
+photos search --person Julie --since 2024
+photos faces show <id>
+photos faces unassigned             # nearest misses first
+photos faces assign <face-id> Julie # becomes a seed for her
+photos people                       # photos found per person
+```
+
+Names come from iCloud, not from you: the People album Apple syncs holds a
+record per person and a few face crops each. The first index run embeds
+those crops as seeds, and a face in a photo is assigned to a person when it
+is close enough (cosine 0.5 by default, `config set face_threshold`) to one
+of that person's seeds. A face you assign by hand becomes a seed too, and
+`photos index --rematch` re-runs matching over every automatically assigned
+face after seeds change. What iCloud does not provide is which faces are in
+which photo; that is what the index adds.
+
+Pass 1 uses thumbnails (about 480 px wide), which is enough for the
+embedding and for faces that fill a fair part of the frame. Small faces in
+group shots need the medium rendition; the index records the source of each
+result so a later pass can redo those. Movies are not indexed yet.
+
 ## Not yet
 
-Semantic search, faces, objects, and shared libraries. The catalogue is
-designed to hold model output alongside the asset rows (with the model
-version and the rendition it was computed from), and previews can be evicted
-after analysis without losing what was learned. The candidates to evaluate
-first are existing open-source stacks, not new code: see `CLAUDE.md`.
+Pass 2 on medium previews, objects beyond what CLIP understands, shared
+libraries, video sampling, GPU or Neural Engine inference. The catalogue
+holds model output alongside the asset rows with the model version and the
+rendition it came from, so previews can be evicted after analysis and a model
+change re-indexes only what it must.
 
 ## Tests
 

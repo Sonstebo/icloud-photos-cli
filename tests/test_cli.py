@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import numpy as np
 import os
 import subprocess
 import sys
@@ -33,7 +34,7 @@ def make_asset(n: int, **over) -> AssetInfo:
         versions={
             "original": {"bytes": 3_000_000, "width": 4032, "height": 3024, "type": "public.heic", "filename": f"IMG_{n:04d}.HEIC"},
             "medium": {"bytes": 300_000, "width": 1600, "height": 1200, "type": "public.jpeg", "filename": f"IMG_{n:04d}.JPG"},
-            "thumb": {"bytes": 30_000, "width": 400, "height": 300, "type": "public.jpeg", "filename": f"IMG_{n:04d}.JPG"},
+            "thumb": {"bytes": 30_000 + n, "width": 400, "height": 300, "type": "public.jpeg", "filename": f"IMG_{n:04d}.JPG"},
         })
     base.update(over)
     return AssetInfo(**base)
@@ -128,8 +129,43 @@ class FakeCloud:
         self.downloads.append((asset_id, version))
         return b"x" * a.versions[version]["bytes"]
 
+    def download_many(self, items, version, threads=4):
+        for asset_id, master_id in items:
+            yield asset_id, self.download(asset_id, version, master_id)
+
+    def download_face_crop(self, crop_id):
+        self.downloads.append((crop_id, "facecrop"))
+        return b"CROP:" + crop_id.encode()
+
     def albums(self):
         return list(self.album_list)
+
+
+class StubModels:
+    """Deterministic stand-ins: an image's embedding is derived from its bytes, faces from a table."""
+
+    clip_name, face_name = "stub-clip", "stub-face"
+
+    def __init__(self):
+        self.faces_by_key = {}      # image-bytes-key -> list of face embeddings (np arrays)
+        self.text_vectors = {}      # query -> vector
+
+    @staticmethod
+    def _unit(seed):
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(512).astype(np.float32)
+        return v / np.linalg.norm(v)
+
+    def embed_image(self, bgr):
+        return self._unit(int(bgr[0, 0, 0]))          # decode_image is patched to carry a key in pixel 0
+
+    def embed_text(self, text):
+        return self.text_vectors.get(text, self._unit(hash(text) % 1000))
+
+    def faces(self, bgr):
+        key = int(bgr[0, 0, 0])
+        return [{"box": [1, 2, 3, 4], "det": 0.9, "age": 30, "gender": 1, "embedding": e.tobytes()}
+                for e in self.faces_by_key.get(key, [])]
 
 
 def stub_record(**fields):
@@ -385,6 +421,90 @@ class CliTest(unittest.TestCase):
         self.j("collection", "delete", "book")
         self.assertEqual(self.j("collection", "list")[0], [])
         self.assertEqual(len(self.cloud.assets), 8)
+
+    # --- index, faces, semantic search ---------------------------------------
+    def with_models(self):
+        from icloud_photos import index as ix
+        from icloud_photos import ml
+        models = StubModels()
+        # decode_image: the stub reads a key from pixel 0; map bytes -> a 2x2 image whose pixel carries the key
+        def decode(data):
+            key = ((len(data) * 7 + data[-1]) if data else 0) % 250
+            return np.full((2, 2, 3), key, dtype=np.uint8)
+        self._decode_patch = (ix, ix.decode_image)
+        ix.decode_image = decode
+        self.addCleanup(lambda: setattr(ix, "decode_image", self._decode_patch[1]))
+        return models, decode
+
+    def key_of(self, asset_id, version="thumb"):
+        data = self.cloud.download(asset_id, version, self.cloud.assets[asset_id].master_id)
+        self.cloud.downloads.pop()
+        return (len(data) * 7 + data[-1]) % 250
+
+    def run_ix(self, *argv, models, expect=0):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main(["--json", *argv], adapter_factory=lambda app: self.cloud, models_factory=lambda app: models)
+        self.assertEqual(rc, expect, f"argv={argv}\nstdout={out.getvalue()}\nstderr={err.getvalue()}")
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None, err.getvalue()
+
+    def test_index_seeds_people_embeds_images_and_names_faces(self):
+        models, decode = self.with_models()
+        thea = StubModels._unit(1); ingjerd = StubModels._unit(2); stranger = StubModels._unit(3)
+        # the seed crops: fc1, fc2 -> p1 (Thea), fc3 -> p2 (Ingjerd); a crop's "image" carries the key of its bytes
+        for crop, vec in (("fc1", thea), ("fc2", thea), ("fc3", ingjerd)):
+            models.faces_by_key[(len(b"CROP:" + crop.encode()) * 7 + ord(crop[-1])) % 250] = [vec]
+        self.j("sync")
+        # faces in photos: A001 has Thea + a stranger, A002 has Ingjerd (near), A003 none
+        near_ingjerd = ingjerd + 0.3 * StubModels._unit(9); near_ingjerd /= np.linalg.norm(near_ingjerd)
+        models.faces_by_key[self.key_of("A001/x+y==")] = [thea, stranger]
+        models.faces_by_key[self.key_of("A002/x+y==")] = [near_ingjerd]
+        r, _ = self.run_ix("index", models=models)
+        self.assertEqual((r["seed"]["crops"], r["seed"]["seeded"]), (3, 3))
+        # 7 images; the movie is not indexed in pass 1
+        self.assertEqual((r["index"]["todo"], r["index"]["done"], r["index"]["faces"], r["index"]["named"]), (7, 7, 3, 2))
+        s, _ = self.j("status", "--offline")
+        self.assertEqual((s["index"]["indexed"], s["index"]["faces_named"], s["index"]["seeded_people"]), (7, 2, 2))
+        # a second run has nothing to do
+        r, _ = self.run_ix("index", models=models)
+        self.assertEqual(r["index"]["todo"], 0)
+        # who is where
+        faces, _ = self.j("faces", "show", "A001/x+y==")
+        self.assertEqual(sorted(str(f["person_name"]) for f in faces), ["None", "Thea-Oline"])
+        self.assertEqual([a["id"] for a in self.j("search", "--person", "Thea-Oline")[0]["results"]], ["A001/x+y=="])
+        self.assertEqual([a["id"] for a in self.j("search", "--person", "Ingjerd")[0]["results"]], ["A002/x+y=="])
+        people, _ = self.j("people")
+        self.assertEqual({p["name"]: p["photos"] for p in people}, {"Thea-Oline": 1, "Ingjerd Thürmer": 1})
+        _, err = self.j("search", "--person", "Nobody", expect=1)
+        self.assertEqual(json.loads(err)["error"], "unknown-person")
+        # the stranger: unassigned, then assigned by hand, which seeds the person and survives re-indexing
+        un, _ = self.j("faces", "unassigned")
+        self.assertEqual(len(un), 1)
+        self.j("faces", "assign", str(un[0]["id"]), "Ingjerd")
+        self.assertEqual(len(self.j("search", "--person", "Ingjerd")[0]["results"]), 2)
+        self.assertEqual(self.j("status", "--offline")[0]["index"]["seeds"], 4)
+        # semantic search: the query vector equals A003's image vector, so A003 ranks first with score ~1
+        models.text_vectors["a unicorn"] = StubModels._unit(self.key_of("A003/x+y=="))
+        r, _ = self.run_ix("search", "--semantic", "a unicorn", "--limit", "3", models=models)
+        self.assertEqual(r["results"][0]["id"], "A003/x+y==")
+        self.assertGreater(r["results"][0]["score"], 0.99)
+        self.assertEqual(len(r["results"]), 3)
+        # ...and filters still apply on top of the ranking
+        r, _ = self.run_ix("search", "--semantic", "a unicorn", "--favorite", models=models)
+        self.assertEqual([a["id"] for a in r["results"]], ["A003/x+y=="])
+        r, _ = self.run_ix("search", "--similar", "A003/x+y==", "--limit", "2", models=models)
+        self.assertEqual(r["results"][0]["id"], "A003/x+y==")
+        _, err = self.run_ix("search", "--similar", "A999", models=models, expect=1)
+        self.assertEqual(json.loads(err)["error"], "not-indexed")
+
+    def test_index_survives_a_failed_download_and_the_cache_budget(self):
+        models, _ = self.with_models()
+        self.j("sync")
+        self.j("config", "set", "cache_budget_mb", "0")
+        broken = self.cloud.assets["A005/x+y=="]; broken.versions = {"original": broken.versions["original"]}
+        r, _ = self.run_ix("index", models=models)
+        self.assertEqual((r["index"]["done"], r["index"]["failed"]), (6, 1))
+        self.assertEqual(self.j("cache", "status")[0]["files"], 0)
 
     # --- status, errors, help ----------------------------------------------
     def test_status_reports_without_a_sync_and_after_one(self):

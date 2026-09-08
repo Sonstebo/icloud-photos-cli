@@ -96,6 +96,10 @@ class Adapter(Protocol):
         ...
     def asset_from_records(self, asset: RawRecord, master: RawRecord) -> AssetInfo: ...
     def download(self, asset_id: str, version: str, master_id: str | None = None) -> bytes | None: ...
+    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
+        """(asset_id, master_id) pairs -> (asset_id, bytes); one lookup per batch, downloads in parallel."""
+        ...
+    def download_face_crop(self, crop_id: str) -> bytes | None: ...
     def albums(self) -> list[AlbumInfo]: ...
 
 
@@ -220,6 +224,49 @@ class ICloudAdapter:
             return None
         photo = library.asset_type(self.photos(), master, asset, library=library)
         return photo.download(version)
+
+    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
+
+        library = self._library()
+        zone = CKZoneIDReq(**library.zone_id)
+        client = library._client
+
+        def fetch(photo: Any) -> bytes | None:
+            url = photo.download_url(version)
+            return client.download_asset_bytes(url) if url else None
+
+        for i in range(0, len(items), 50):
+            batch = items[i:i + 50]
+            names = [n for pair in batch for n in pair]
+            found = {r.recordName: r for r in client.lookup(record_names=names, zone_id=zone).records
+                     if isinstance(r, CKRecord)}
+            photos = []
+            for asset_id, master_id in batch:
+                asset, master = found.get(asset_id), found.get(master_id)
+                photos.append((asset_id, library.asset_type(self.photos(), master, asset, library=library)
+                               if asset is not None and master is not None else None))
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                futures = [(asset_id, pool.submit(fetch, p) if p is not None else None) for asset_id, p in photos]
+                for asset_id, fut in futures:
+                    try:
+                        yield asset_id, (fut.result() if fut is not None else None)
+                    except Exception:  # noqa: BLE001 - one bad download must not end the run
+                        yield asset_id, None
+
+    def download_face_crop(self, crop_id: str) -> bytes | None:
+        from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
+
+        library = self._library()
+        recs = library._client.lookup(record_names=[crop_id], zone_id=CKZoneIDReq(**library.zone_id)).records
+        rec = next((r for r in recs if isinstance(r, CKRecord)), None)
+        if rec is None:
+            return None
+        res = (rec.model_dump(mode="json").get("fields") or {}).get("resFaceCropRes", {}).get("value") or {}
+        url = res.get("downloadURL")
+        return library._client.download_asset_bytes(url) if url else None
 
     def albums(self) -> list[AlbumInfo]:
         return [AlbumInfo(a.id, a.name, a.fullname) for a in self.photos().albums]
