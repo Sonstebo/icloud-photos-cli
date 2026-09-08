@@ -8,6 +8,15 @@ The user requested this project folder and Markdown handoff following a discussi
 
 ## Decisions (2026-09-08)
 
+- **The overriding goal is a perfect fit for AI assistants working through a CLI.** Every other quality (GUI, speed, breadth of features) is secondary. Concretely:
+  - Every operation is a subcommand; nothing requires a GUI, an interactive prompt or a browser except the one-time iCloud sign-in.
+  - Every subcommand has `--json` output with a documented, stable schema; IDs are stable across runs and reindexing.
+  - Output is bounded by default (`--limit`, paging cursors) so an assistant never gets a library dump in its context.
+  - Errors are one line on stderr plus a non-zero exit, with a machine-readable code in JSON mode; no stack traces, no silent failures.
+  - Every command is idempotent or says what it changed; nothing destructive happens without an explicit flag.
+  - `photos --help` and per-command `--help` are complete enough that an assistant can use the tool from them alone; the README is for humans.
+  - The tool returns file paths for images it fetched, so an assistant can look at a preview with its own image reading.
+  - Long jobs (indexing, downloads) run detached and report progress through `status`; a query never waits on the network.
 - **Reuse before building.** Do not implement anything an existing open-source project already provides: iCloud access, catalogue, thumbnailing, face/object models, vector search. Survey candidates first, verify them on this machine, and write only the glue and whatever is genuinely missing. Say explicitly when something has to be built because no candidate fits.
 - **CLI, not MCP.** The interface for assistants, scripts and the user is a command-line tool with `--json` output, stable asset IDs, errors on stderr and non-zero exits. No MCP server; a wrapper can be added later if a client without shell access needs it.
 - The CLI is the interface, not the whole program. Indexing and preview fetching run in a resumable background worker; the CLI reads and writes the local catalogue and never blocks a query on the network.
