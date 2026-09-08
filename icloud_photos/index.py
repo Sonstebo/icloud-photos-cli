@@ -97,14 +97,16 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
 
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=1)     # the next chunk downloads while this one is analysed
-    staged = [prepare(c) for c in chunks[:1]]
-    pending = pool.submit(download, staged[0][1]) if chunks else None
+    # Only the chunk being analysed and the next one are held; keeping every staged
+    # chunk's decoded images alive grew the worker by ~12 MB per chunk until the OOM killer took it.
+    staged = prepare(chunks[0]) if chunks else None
+    pending = pool.submit(download, staged[1]) if chunks else None
     for i, chunk in enumerate(chunks):
-        images, _ = staged[i]
+        images, _ = staged
         downloaded = pending.result()
         if i + 1 < len(chunks):
-            staged.append(prepare(chunks[i + 1]))
-            pending = pool.submit(download, staged[i + 1][1])
+            staged = prepare(chunks[i + 1])
+            pending = pool.submit(download, staged[1])
         for asset_id, data in downloaded:
             img = decode_image(data)
             if img is None:

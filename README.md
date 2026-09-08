@@ -36,6 +36,11 @@ photos sync --albums --background
 photos status                    # repeat until sync_running is false
 ```
 
+`--background` starts the job as a transient systemd user unit
+(`icloud-photos-sync-*`, `icloud-photos-index-*`), so it outlives the terminal
+and is killed on its own if memory runs out; the log file is where to look, and
+`ICLOUD_PHOTOS_WORKER=plain` falls back to a detached process.
+
 The first sync lists the whole library, metadata only: no image is
 downloaded. Later syncs read the change feed and touch only what changed; a
 sync when nothing changed does no listing at all. `photos sync --full`

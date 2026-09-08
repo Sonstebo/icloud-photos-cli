@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -230,18 +232,52 @@ def _pid(lock: Path) -> int | None:
         return None
 
 
+def _spawn_worker(name: str, argv: list[str], log_path: Path, lock: Path) -> dict[str, Any]:
+    """Start a detached worker for a long job.
+
+    Under systemd the worker gets its own transient user unit: it outlives the
+    terminal it was started from, and when memory runs out the kernel kills one
+    unit, not the terminal session and every job in it (which is how a 2026-09-08
+    index run, a compiler and the assistant's session all died together).
+    ICLOUD_PHOTOS_WORKER=plain, or no usable systemd, gives a plain detached process.
+    """
+    cmd = [sys.executable, "-m", "icloud_photos", "--json", *argv]
+    unit = None
+    if os.environ.get("ICLOUD_PHOTOS_WORKER", "systemd") == "systemd" and shutil.which("systemd-run"):
+        unit = f"icloud-photos-{name}-{int(time.time())}"
+        # The unit does not inherit this shell's environment; pass through our own settings only.
+        env = [f"--setenv={k}={v}" for k, v in os.environ.items() if k.startswith("ICLOUD_PHOTOS_")]
+        run = subprocess.run(["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}",
+                              f"--property=StandardOutput=append:{log_path}",
+                              f"--property=StandardError=append:{log_path}", *env, "--", *cmd],
+                             capture_output=True, text=True)
+        if run.returncode != 0:
+            unit = None
+    if unit is None:
+        log = log_path.open("ab")
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        return {"started": True, "pid": proc.pid, "unit": None, "log": str(log_path)}
+    pid = None
+    for _ in range(40):                       # the worker writes its own pid into the lock as it starts
+        if (pid := _pid(lock)) is not None:
+            break
+        time.sleep(0.05)
+    return {"started": True, "pid": pid, "unit": unit, "log": str(log_path)}
+
+
+def _started_text(name: str) -> Callable[[dict[str, Any]], str]:
+    return lambda p: (f"{name} started in the background (pid {p['pid']}"
+                      + (f", unit {p['unit']}" if p.get("unit") else "")
+                      + f"), log at {p['log']}; watch with `photos status`")
+
+
 def cmd_sync(app: App, args: argparse.Namespace) -> int:
     if (pid := _sync_pid(app)) is not None:
         raise CliError("sync-running", f"a sync is already running (pid {pid}); see `photos status`")
     if args.background:
         flags = ["--full"] if args.full else []
-        log = app.paths.sync_log.open("ab")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "icloud_photos", "--json", "sync", *flags],
-            stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-        app.emit({"started": True, "pid": proc.pid, "log": str(app.paths.sync_log)},
-                 lambda p: f"sync started in the background (pid {p['pid']}), log at {p['log']}; "
-                           f"watch with `photos status`")
+        app.emit(_spawn_worker("sync", ["sync", *flags], app.paths.sync_log, app.paths.sync_lock),
+                 _started_text("sync"))
         return 0
     app.paths.sync_lock.write_text(str(os.getpid()))
     try:
@@ -286,11 +322,8 @@ def cmd_index(app: App, args: argparse.Namespace) -> int:
             flags += ["--limit", str(args.limit)]
         if args.threshold is not None:
             flags += ["--threshold", str(args.threshold)]
-        log = app.paths.index_log.open("ab")
-        proc = subprocess.Popen([sys.executable, "-m", "icloud_photos", "--json", "index", *flags],
-                                stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-        app.emit({"started": True, "pid": proc.pid, "log": str(app.paths.index_log)},
-                 lambda p: f"index started in the background (pid {p['pid']}), log at {p['log']}; watch with `photos status`")
+        app.emit(_spawn_worker("index", ["index", *flags], app.paths.index_log, app.paths.index_lock),
+                 _started_text("index"))
         return 0
     threshold = args.threshold if args.threshold is not None else float(app.config.values.get("face_threshold", indexing.DEFAULT_THRESHOLD))
     app.paths.index_lock.write_text(str(os.getpid()))

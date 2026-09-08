@@ -546,6 +546,7 @@ class CliTest(unittest.TestCase):
 
     def test_background_sync_runs_detached_and_refuses_to_double_up(self):
         import time
+        from unittest import mock
         lock = Path(self.tmp.name) / "state" / "sync.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
         lock.write_text(str(os.getpid()))
@@ -554,7 +555,9 @@ class CliTest(unittest.TestCase):
         lock.unlink()
         # the detached child is a real `photos` with no session: it must end quickly
         # with a not-logged-in error in the log, not hang or prompt
-        r, _ = self.j("sync", "--background")
+        with mock.patch.dict(os.environ, {"ICLOUD_PHOTOS_WORKER": "plain"}):
+            r, _ = self.j("sync", "--background")
+        self.assertIsNone(r["unit"])
         for _ in range(300):
             try:
                 os.kill(r["pid"], 0)
@@ -571,6 +574,21 @@ class CliTest(unittest.TestCase):
         log = Path(r["log"]).read_text()
         self.assertIn('"error": "not-logged-in"', log)
         self.assertFalse(lock.exists())
+
+    def test_background_sync_under_systemd_gets_its_own_unit(self):
+        import shutil, time
+        if not shutil.which("systemd-run") or subprocess.run(
+                ["systemd-run", "--user", "--quiet", "--collect", "--wait", "true"], capture_output=True).returncode:
+            self.skipTest("no usable systemd user manager")
+        r, _ = self.j("sync", "--background")
+        self.assertTrue(r["unit"].startswith("icloud-photos-sync-"))
+        for _ in range(300):
+            if "not-logged-in" in Path(r["log"]).read_text():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("background sync under systemd did not finish")
+        self.assertFalse((Path(self.tmp.name) / "state" / "sync.lock").exists())
 
 
 if __name__ == "__main__":
