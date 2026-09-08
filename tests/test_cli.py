@@ -310,6 +310,17 @@ class CliTest(unittest.TestCase):
         out, _ = self.run_cli("show", "A001/x+y==", "--size", "medium")
         self.assertRegex(out, r"^A001/x\+y==\t.*/medium/A001_x_y__\.jpg\n$")
 
+    def test_show_falls_back_when_the_size_is_missing(self):
+        small = make_asset(40, versions={"original": {"bytes": 300_000, "type": "public.png", "filename": "a.PNG"},
+                                         "thumb": {"bytes": 20_000, "type": "public.jpeg", "filename": "a.JPG"}})
+        big = make_asset(41, versions={"original": {"bytes": 30_000_000, "type": "public.heic", "filename": "b.HEIC"},
+                                       "thumb": {"bytes": 20_000, "type": "public.jpeg", "filename": "b.JPG"}})
+        self.cloud.add(small, big)
+        self.j("sync")
+        r, _ = self.j("show", "A040/x+y==", "A041/x+y==", "--size", "medium")
+        self.assertEqual([x["version"] for x in r], ["original", "thumb"])
+        self.assertTrue(r[0]["path"].endswith(".png"))
+
     def test_original_pin_evict_and_the_budget(self):
         self.j("sync")
         self.j("config", "set", "cache_budget_mb", "7")  # room for two originals, not three

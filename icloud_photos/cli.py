@@ -329,6 +329,13 @@ def cmd_show(app: App, args: argparse.Namespace) -> int:
     results = []
     for asset in _assets(app, args.id):
         version = size if asset["kind"] == "image" else f"{size}_image"
+        if version not in asset["versions"]:
+            # PNGs and some imports have no medium: the original if it is small, else the thumb
+            original = asset["versions"].get("original", {})
+            if asset["kind"] == "image" and (original.get("bytes") or 0) <= 4 * 1024 * 1024:
+                version = "original"
+            else:
+                version = "thumb" if asset["kind"] == "image" else "thumb_image"
         results.append(_fetch(app, asset, version))
     app.emit(results, lambda rs: "\n".join(f"{r['id']}\t{r['path']}" for r in rs))
     return 0
@@ -489,7 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
                        description="Prints one `id<TAB>path` line per asset (or JSON). Look at the file to see "
                                    "the picture. Previews are small JPEGs; use `original` for the real file.")
     s.add_argument("id", nargs="+")
-    s.add_argument("--size", choices=PREVIEW_SIZES, help="thumb (default, from config) or medium")
+    s.add_argument("--size", choices=PREVIEW_SIZES, help="thumb (default, from config) or medium; an asset without "
+                                                          "that rendition gets its original if under 4 MB, else the thumb "
+                                                          "(the output says which)")
     s.set_defaults(fn=cmd_show)
 
     s = sub.add_parser("original", help="fetch full-resolution originals into the cache",
