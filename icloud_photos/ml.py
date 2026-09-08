@@ -62,11 +62,71 @@ def decode_image(data: bytes) -> np.ndarray | None:
         return None
 
 
+COMPUTE_MODES = ("auto", "cpu", "gpu")
+# The ggml provider: GPU device, im2col convolutions (1.4x faster than the direct
+# kernel; rounds to f16 on Vulkan, which cosine-compared embeddings do not notice),
+# and partial claims so a graph with one unsupported op still runs mostly there.
+GGML_OPTIONS = {"device": "gpu", "conv2d_im2col": "1", "partial": "1"}
+
+
+class ComputeUnavailable(Exception):
+    """compute=gpu was asked for and no working GPU provider exists."""
+
+
+def resolve_compute(mode: str) -> tuple[str, str]:
+    """(where models run, why): "gpu" through onnxruntime-ggml when it imports and a
+    small convolution on the GPU matches onnxruntime's CPU, otherwise "cpu" with the
+    reason. `gpu` raises ComputeUnavailable instead of falling back."""
+    if mode not in COMPUTE_MODES:
+        raise ValueError(f"compute must be one of {', '.join(COMPUTE_MODES)}")
+    if mode == "cpu":
+        return "cpu", "configured"
+    import os
+    os.environ.setdefault("ORT_GGML_LOG", "warn")   # the provider logs at info by default, on stderr
+    try:
+        import onnxruntime_ggml as ggml
+    except ImportError:
+        reason = "onnxruntime-ggml is not installed (pip install onnxruntime-ggml)"
+        if mode == "gpu":
+            raise ComputeUnavailable(reason) from None
+        return "cpu", reason
+    try:
+        import onnx
+        import onnxruntime as ort
+        from onnx import TensorProto, helper, numpy_helper
+        rng = np.random.default_rng(0)
+        w = rng.standard_normal((4, 3, 3, 3)).astype(np.float32)
+        graph = helper.make_graph(
+            [helper.make_node("Conv", ["x", "w"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]), helper.make_node("Relu", ["c"], ["y"])],
+            "selftest", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 3, 8, 8])],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4, 8, 8])], [numpy_helper.from_array(w, "w")])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+        model.ir_version = 8
+        blob = model.SerializeToString()
+        x = rng.standard_normal((1, 3, 8, 8)).astype(np.float32)
+        quiet = ort.SessionOptions()
+        quiet.log_severity_level = 3
+        ref = ort.InferenceSession(blob, quiet, providers=["CPUExecutionProvider"]).run(None, {"x": x})[0]
+        got = ggml.InferenceSession(blob, GGML_OPTIONS, sess_options=quiet).run(None, {"x": x})[0]
+        err = float(np.max(np.abs(ref - got)))
+        if err > 1e-2:
+            raise RuntimeError(f"GPU self-test disagrees with the CPU by {err:.3g}")
+    except Exception as err:  # noqa: BLE001 - any failure here means: use the CPU
+        reason = f"GPU provider unusable: {type(err).__name__}: {str(err).splitlines()[0][:160]}"
+        if mode == "gpu":
+            raise ComputeUnavailable(reason) from err
+        return "cpu", reason
+    version = getattr(ggml, "__version__", "?")
+    return "gpu", f"onnxruntime-ggml {version}"
+
+
 class OnnxModels:
-    def __init__(self, models_dir: Path, threads: int | None = None) -> None:
+    def __init__(self, models_dir: Path, threads: int | None = None, compute: str = "auto") -> None:
         self.dir = Path(models_dir)
         self.clip_name, self.face_name = CLIP_MODEL, FACE_MODEL
         self.threads = threads
+        self.compute_mode = compute
+        self._compute: tuple[str, str] | None = None
         self._visual = self._textual = self._tokenizer = self._faces = None
         self._cfg: dict[str, Any] | None = None
 
@@ -78,14 +138,29 @@ class OnnxModels:
             raise ModelsMissing(f"CLIP model files missing under {d}: {', '.join(missing)}; run `photos index --fetch-models`")
         return d
 
-    def _session(self, path: Path) -> Any:
+    @property
+    def compute(self) -> tuple[str, str]:
+        """Resolved once per process: ("gpu" | "cpu", detail)."""
+        if self._compute is None:
+            self._compute = resolve_compute(self.compute_mode)
+        return self._compute
+
+    def _options(self) -> Any:
         import onnxruntime as ort
 
         opts = ort.SessionOptions()
         if self.threads:
             opts.intra_op_num_threads = self.threads
         opts.log_severity_level = 3
-        return ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
+        return opts
+
+    def _session(self, path: Path) -> Any:
+        import onnxruntime as ort
+
+        if self.compute[0] == "gpu":
+            import onnxruntime_ggml as ggml
+            return ggml.InferenceSession(str(path), GGML_OPTIONS, sess_options=self._options())
+        return ort.InferenceSession(str(path), sess_options=self._options(), providers=["CPUExecutionProvider"])
 
     def _load_clip(self) -> None:
         if self._visual is not None:
@@ -146,6 +221,13 @@ class OnnxModels:
             # the pack downloads itself on first use (~280 MB from InsightFace's GitHub release)
             app = FaceAnalysis(name=FACE_MODEL, root=str(root), providers=["CPUExecutionProvider"])
             app.prepare(ctx_id=-1, det_size=(640, 640))
+        if self.compute[0] == "gpu":
+            # insightface builds plain CPU sessions and keeps each under model.session,
+            # reading input and output names at construction; the same files opened
+            # through the provider are drop-in replacements.
+            import onnxruntime_ggml as ggml
+            for model in app.models.values():
+                model.session = ggml.InferenceSession(model.model_file, GGML_OPTIONS, sess_options=self._options())
         self._faces = app
 
     def faces(self, bgr: np.ndarray) -> list[dict[str, Any]]:

@@ -18,6 +18,7 @@ DEFAULTS = {
     "username": "",            # Apple ID; empty means "the one session in session_dir"
     "preview_size": "thumb",   # what `show` fetches by default: thumb or medium
     "face_threshold": 0.5,     # cosine similarity for naming a face from a person's seeds
+    "compute": "auto",         # where CLIP and the face models run: auto (GPU when a working one is found), cpu, gpu
 }
 
 

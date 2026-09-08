@@ -616,3 +616,37 @@ class RetryTests(unittest.TestCase):
         with self.assertRaises(CloudError):
             retry(not_cloud, "lookup", delays=(1,), sleep=slept.append)
         self.assertEqual(slept, [1, 2, 1, 2])   # our own errors are not retried
+
+
+class ComputeTests(unittest.TestCase):
+    def test_cpu_mode_and_missing_provider(self):
+        import sys
+        from unittest import mock
+
+        from icloud_photos.ml import ComputeUnavailable, resolve_compute
+        self.assertEqual(resolve_compute("cpu"), ("cpu", "configured"))
+        with mock.patch.dict(sys.modules, {"onnxruntime_ggml": None}):   # import fails
+            self.assertEqual(resolve_compute("auto")[0], "cpu")
+            self.assertIn("not installed", resolve_compute("auto")[1])
+            with self.assertRaises(ComputeUnavailable):
+                resolve_compute("gpu")
+        with self.assertRaises(ValueError):
+            resolve_compute("tpu")
+
+    def test_broken_provider_falls_back_with_reason(self):
+        import sys, types
+        from unittest import mock
+
+        from icloud_photos.ml import ComputeUnavailable, resolve_compute
+        fake = types.ModuleType("onnxruntime_ggml")
+        fake.__version__ = "0.0"
+        def boom(*a, **k):
+            raise RuntimeError("device=gpu requested but no gpu backend is available")
+        fake.InferenceSession = boom
+        with mock.patch.dict(sys.modules, {"onnxruntime_ggml": fake}):
+            resolved, detail = resolve_compute("auto")
+            self.assertEqual(resolved, "cpu")
+            self.assertIn("no gpu backend", detail)
+            with self.assertRaises(ComputeUnavailable):
+                resolve_compute("gpu")
+

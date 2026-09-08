@@ -17,6 +17,18 @@ project adds only what pyicloud does not have and an assistant needs: the
 durable catalogue, the cache with a budget, pinning and eviction, named
 collections, and the CLI.
 
+## GPU
+
+CLIP and the face models run through onnxruntime. With
+[onnxruntime-ggml](https://github.com/thewh1teagle/onnxruntime-ggml) installed
+in the same environment they run on the GPU instead, through Vulkan or Metal,
+at a fraction of the CPU's energy: on an Apple M1 under Asahi Linux the face
+pass draws about 12 W instead of 27 W for the same work, and is slightly
+faster. `config set compute auto|cpu|gpu` chooses; `auto` (the default) uses
+the GPU when the provider imports and a small convolution on it matches the
+CPU, and says why in `photos status` when it does not. Nothing else changes:
+embeddings from either path compare at cosine 1.0000.
+
 ## Install
 
 ```sh
@@ -71,11 +83,12 @@ systemctl --user enable --now icloud-photos-sync.timer
 | `people [--all]` | people from iCloud's People album, with photos found per person | no |
 | `index [--limit N] [--seed] [--rematch] [--threshold T] [--fetch-models] [--background]` | CLIP embeddings and faces | yes |
 | `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
-| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold` | no |
+| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
 includes the whole of the period given. Exit codes: 1 error, 2 needs a
-terminal, 3 not logged in, 4 cache full, 5 model files missing. With `--json`, errors are
+terminal, 3 not logged in, 4 cache full, 5 model files missing, 6 `compute=gpu`
+without a usable GPU. With `--json`, errors are
 `{"error": code, "message": text}` on stderr.
 
 ## An assistant's session

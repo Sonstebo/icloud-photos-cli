@@ -26,7 +26,7 @@ from .catalog import Catalog
 from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
 from . import index as indexing
-from .ml import ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob
+from .ml import COMPUTE_MODES, ComputeUnavailable, ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob, resolve_compute
 
 EXT_BY_TYPE = {
     "public.jpeg": ".jpg", "public.heic": ".heic", "public.heif": ".heif", "public.png": ".png",
@@ -52,7 +52,7 @@ class App:
                  models_factory: Callable[["App"], Any] | None = None) -> None:
         self.json = json_mode
         self._models: Any = None
-        self._models_factory = models_factory or (lambda app: OnnxModels(app.paths.models_dir))
+        self._models_factory = models_factory or (lambda app: OnnxModels(app.paths.models_dir, compute=str(app.config.values.get("compute", "auto"))))
         self.paths = Paths.discover().ensure()
         self.config = Config.load(self.paths.config_file)
         self._catalog: Catalog | None = None
@@ -187,6 +187,7 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
                                                 "progress": json.loads(ip) if (ip := app.catalog.get_meta("index_progress")) else None},
         "paths": {"catalog": str(app.paths.catalog_db), "cache": str(app.paths.cache_dir),
                   "session": str(app.paths.session_dir), "config": str(app.paths.config_file)},
+        "compute": _compute_status(app),
     }
 
     def text(p: dict[str, Any]) -> str:
@@ -210,10 +211,22 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
         ix = p["index"]
         lines.append(f"index:    {ix['indexed']} of {ix['images']} images; {ix['faces']} faces, {ix['faces_named']} named; "
                      f"{ix['seeds']} seeds for {ix['seeded_people']} people" + (f"; running {ix['progress']}" if ix["running"] else ""))
+        cp = p["compute"]
+        lines.append(f"compute:  {cp['resolved']} ({cp['detail']}; configured {cp['mode']})")
         return "\n".join(lines)
 
     app.emit(payload, text)
     return 0
+
+
+def _compute_status(app: App) -> dict[str, Any]:
+    """Where the models would run right now, resolved the same way the index does."""
+    mode = str(app.config.values.get("compute", "auto"))
+    try:
+        resolved, detail = resolve_compute(mode)
+    except (ComputeUnavailable, ValueError) as err:
+        resolved, detail = "unavailable", str(err)
+    return {"mode": mode, "resolved": resolved, "detail": detail}
 
 
 def _sync_pid(app: App) -> int | None:
@@ -342,6 +355,8 @@ def cmd_index(app: App, args: argparse.Namespace) -> int:
                                               threshold=threshold, progress=progress)
         except ModelsMissing as err:
             raise CliError("models-missing", str(err), 5) from err
+        except ComputeUnavailable as err:
+            raise CliError("compute-unavailable", str(err), 6) from err
     finally:
         app.paths.index_lock.unlink(missing_ok=True)
 
@@ -595,6 +610,8 @@ def cmd_collection(app: App, args: argparse.Namespace) -> int:
 
 def cmd_config(app: App, args: argparse.Namespace) -> int:
     if args.config_cmd == "set":
+        if args.key == "compute" and args.value not in COMPUTE_MODES:
+            raise CliError("bad-value", f"compute must be one of {', '.join(COMPUTE_MODES)}")
         try:
             app.config.set(args.key, args.value)
         except KeyError:
@@ -617,7 +634,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "without the network. Images are fetched on demand into a bounded cache; `show`\n"
                     "and `original` print the local path of the file they fetched. Asset ids are stable.\n"
                     "Add --json to any command for structured output; errors are one line on stderr\n"
-                    "with a non-zero exit (2 needs a terminal, 3 not logged in, 4 cache full, 5 models missing).",
+                    "with a non-zero exit (2 needs a terminal, 3 not logged in, 4 cache full, 5 models missing,\n"
+                    "6 compute=gpu without a usable GPU).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="typical session:\n"
                "  photos login                      once, interactive (password + two-factor code)\n"
