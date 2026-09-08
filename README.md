@@ -46,7 +46,7 @@ Python 3.11 or newer. Nothing outside the venv.
 
 ```sh
 photos login                     # password + two-factor code; offer to store the password in the keyring
-photos sync --albums --background
+photos sync --background
 photos status                    # repeat until sync_running is false
 ```
 
@@ -65,7 +65,7 @@ To keep the catalogue fresh without thinking about it:
 ```sh
 mkdir -p ~/.config/systemd/user
 cp systemd/icloud-photos-sync.* ~/.config/systemd/user/
-systemctl --user enable --now icloud-photos-sync.timer
+systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 ```
 
 ## Commands
@@ -74,7 +74,7 @@ systemctl --user enable --now icloud-photos-sync.timer
 | --- | --- | --- |
 | `login [--username ID] [--logout]` | sign in through pyicloud's CLI; needs a terminal | yes |
 | `status [--offline]` | auth state, catalogue counts, cache usage, sync progress | unless `--offline` |
-| `sync [--full] [--albums] [--limit N] [--background]` | update the catalogue | yes |
+| `sync [--full] [--background]` | update the catalogue: assets, albums, people, face crops | yes |
 | `albums` | albums in the catalogue with counts | no |
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `info ID...` | every field, cached renditions, albums, collections | no |
