@@ -23,7 +23,7 @@ pyicloud findings, for an upstream report: (1) `PhotoAlbum.photos` stops when a 
 
 Not started: pass 2 on medium previews, shared library, video sampling, ANE inference, a bug report to pyicloud.
 
-Published to GitHub (see above). The systemd user timer in `systemd/` is written but not enabled.
+Published to GitHub (see above). The hourly sync timer is enabled.
 
 ## Decisions (2026-09-08)
 

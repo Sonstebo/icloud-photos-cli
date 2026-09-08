@@ -7,8 +7,8 @@ through URL schemes keyed by file id. This writes the rows a folder scan
 would have produced, so lap needs no change to browse our library:
 
 - one album rooted at a tree of symlinks under our cache
-  (`<root>/YYYY/MM/<asset id>__<stem>.jpg` -> the best cached JPEG rendition;
-  the id is filename-safe as in the cache),
+  (`<root>/YYYY/MM/<asset id>@<stem>.jpg` -> the best cached JPEG rendition; the
+  id is filename-safe as in the cache, and `@` cannot occur in it),
 - `afiles` with our dates, dimensions, GPS, favourite and caption,
 - `athumbs` from our thumbnails, scaled to lap's thumbnail size,
 - `afiles.embeds` from our CLIP vectors (lap uses the same ViT-B/32 weights),
@@ -16,8 +16,9 @@ would have produced, so lap needs no change to browse our library:
 - `acollections` from our collections.
 
 A file whose rendition is not cached keeps its row and thumbnail but has a
-dangling symlink until something fetches it; lap shows the thumbnail and
-cannot open it. Re-running is idempotent: rows are matched by folder and name.
+dangling symlink until lap's fetch-on-open command (`photos lap-fetch`) gets
+it. Re-running is idempotent: rows are matched by folder and name, and rows or
+links the catalogue no longer has are removed.
 """
 
 from __future__ import annotations
@@ -110,6 +111,12 @@ class LapLibrary:
                               (ALBUM_NAME, str(self.root), now, now))
         return int(cur.lastrowid)
 
+    def set_fetch_command(self, album_id: int, command: str | None) -> None:
+        """lap's fetch-on-open command for the album, when this lap has the column (its migration 17)."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(albums)")}
+        if "fetch_command" in cols:
+            self.db.execute("UPDATE albums SET fetch_command=? WHERE id=?", (command, album_id))
+
     def folder_id(self, album_id: int, path: Path, has_subfolders: bool) -> int:
         row = self.db.execute("SELECT id FROM afolders WHERE album_id=? AND path=?", (album_id, str(path))).fetchone()
         if row:
@@ -180,7 +187,12 @@ class LapLibrary:
         return cid
 
 
-def _link(path: Path, target: Path | None) -> None:
+def asset_id_of(entry_name: str) -> str:
+    """The (filename-safe) asset id an album entry name starts with."""
+    return entry_name.split("@", 1)[0]
+
+
+def link(path: Path, target: Path | None) -> None:
     """A symlink at `path` to `target`, or none when there is nothing to point at."""
     if path.is_symlink() or path.exists():
         if target is not None and path.is_symlink() and os.readlink(path) == str(target):
@@ -202,10 +214,11 @@ def rendition_dims(asset: dict[str, Any], version: str) -> tuple[int | None, int
 
 
 def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None = None,
-           progress: Progress = _noop) -> dict[str, Any]:
+           fetch_command: str | None = None, progress: Progress = _noop) -> dict[str, Any]:
     result: dict[str, Any] = {"library": str(lap.db_path), "root": str(lap.root), "files": 0, "linked": 0,
                               "thumbs": 0, "embeddings": 0, "faces": 0, "people": 0, "collections": 0, "skipped": 0}
     album = lap.album_id()
+    lap.set_fetch_command(album, fetch_command)
     root_folder = lap.folder_id(album, lap.root, True)
     folders: dict[str, int] = {}
     file_ids: dict[str, int] = {}
@@ -213,6 +226,8 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
     lap_people: dict[str, int] = {}
     q = "SELECT * FROM assets WHERE hidden=0 AND missing_since IS NULL ORDER BY taken DESC" + (f" LIMIT {int(limit)}" if limit else "")
     assets = [dict(r) for r in catalog.db.execute(q)]
+    run_started_ms = int(time.time() * 1000)
+    seen: set[str] = set()
     lap.db.execute("BEGIN")
     try:
         for n, a in enumerate(assets, 1):
@@ -229,11 +244,11 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             if is_image:
                 target = cache.peek(a["id"], "medium") or cache.peek(a["id"], "thumb")
                 linked_version = "medium" if target and target.parent.name == "medium" else "thumb"
-                name = f"{safe_name(a['id'])}__{stem}.jpg"
+                name = f"{safe_name(a['id'])}@{stem}.jpg"
             else:
                 target = cache.peek(a["id"], "original")
                 linked_version = "original"
-                name = f"{safe_name(a['id'])}__{a['filename'] or stem}"
+                name = f"{safe_name(a['id'])}@{a['filename'] or stem}"
             values = {
                 "size": int(a.get("bytes") or 0), "file_type": 1 if is_image else 2,
                 "format_label": "JPG" if is_image else format_label(a.get("filename") or ""),
@@ -252,8 +267,9 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                 "SELECT 1 FROM index_state WHERE asset_id=?", (a["id"],)).fetchone() else 0)
             fid = lap.upsert_file(folders[mkey], name, values)
             file_ids[a["id"]] = fid
+            seen.add(str(lap.root / mkey / name))
             result["files"] += 1
-            _link(lap.root / mkey / name, target)
+            link(lap.root / mkey / name, target)
             if target is not None:
                 result["linked"] += 1
             thumb = cache.peek(a["id"], "thumb")
@@ -289,6 +305,18 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                 "SELECT asset_id FROM collection_assets WHERE collection=? ORDER BY position", (c["name"],)) if r["asset_id"] in file_ids]
             lap.replace_collection(c["name"], ids)
             result["collections"] += 1
+        if limit is None:
+            # rows and links for assets the catalogue no longer has (or renamed entries)
+            stale = lap.db.execute(
+                "SELECT a.id, b.path, a.name FROM afiles a JOIN afolders b ON a.folder_id=b.id "
+                "WHERE b.album_id=? AND a.last_scan_time < ?", (album, run_started_ms)).fetchall()
+            for r in stale:
+                lap.db.execute("DELETE FROM afiles WHERE id=?", (r["id"],))
+                link(Path(r["path"]) / r["name"], None)
+            result["removed"] = len(stale)
+            for p in lap.root.rglob("*"):
+                if p.is_symlink() and str(p) not in seen:
+                    p.unlink()
         lap.db.execute("UPDATE albums SET total=?, indexed=1, last_scan_time=?, modified_at=? WHERE id=?",
                        (result["files"], int(time.time() * 1000), int(time.time()), album))
         lap.db.execute("COMMIT")

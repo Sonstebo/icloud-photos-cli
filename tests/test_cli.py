@@ -694,6 +694,13 @@ class LapExportTests(unittest.TestCase):
             self.assertEqual(len(links), r["linked"])
             bbox = json.loads(con.execute("SELECT bbox FROM faces LIMIT 1").fetchone()[0])
             self.assertEqual(set(bbox), {"x", "y", "width", "height", "confidence"})
+            # lap-fetch: a dangling entry gets its rendition fetched and linked
+            entry = links[0]
+            entry.unlink(); entry.symlink_to(root / "nowhere.jpg")
+            self.assertFalse(entry.exists())
+            f, _ = t.run_ix("lap-fetch", str(entry), models=models)
+            self.assertTrue(entry.exists())
+            self.assertEqual(os.readlink(entry), f["path"])
             # idempotent: a second run changes no counts
             r2, _ = t.run_ix("lap-export", "--library", str(lap_db), "--root", str(root), models=models)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM afiles").fetchone()[0], files)

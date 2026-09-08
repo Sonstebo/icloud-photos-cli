@@ -333,12 +333,36 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
         if not app.json:
             print(f"  {p['done']} of {p['total']}: {p['files']} files, {p['thumbs']} thumbs, {p['faces']} faces", file=sys.stderr)
     try:
-        result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, progress=progress)
+        photos_bin = Path(sys.executable).with_name("photos")
+        fetch = f"{photos_bin if photos_bin.exists() else 'photos'} lap-fetch {{path}}"
+        result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, fetch_command=fetch, progress=progress)
     finally:
         lib.close()
     app.emit(result, lambda r: f"lap library {r['library']}: {r['files']} files ({r['linked']} with a cached file), "
                                f"{r['thumbs']} thumbnails, {r['embeddings']} embeddings, {r['faces']} faces of {r['people']} people, "
                                f"{r['collections']} collections; restart lap to see them")
+    return 0
+
+
+def cmd_lap_fetch(app: App, args: argparse.Namespace) -> int:
+    """lap's fetch-on-open command for our album: PATH is `<root>/YYYY/MM/<id>__<stem>.<ext>`."""
+    target = Path(args.path)
+    asset_id = lap_export.asset_id_of(target.name)
+    row = app.catalog.db.execute("SELECT id FROM assets WHERE id=?", (asset_id,)).fetchone()
+    if row is None:   # the id in the name is filename-safe; real ones are UUIDs, but be complete
+        row = next((r for r in app.catalog.db.execute("SELECT id FROM assets") if lap_export.safe_name(r["id"]) == asset_id), None)
+    if row is None:
+        raise CliError("no-such-asset", f"{target.name} names no asset in the catalogue")
+    asset = _assets(app, [row["id"]])[0]
+    if asset["kind"] == "image":
+        version = "medium" if "medium" in asset["versions"] else (
+            "original" if (asset["versions"].get("original", {}).get("bytes") or 0) <= 4 * 1024 * 1024 else "thumb")
+    else:
+        version = "original"
+    r = _fetch(app, asset, version)
+    lap_export.link(target, Path(r["path"]))
+    app.emit({"id": asset["id"], "version": version, "path": r["path"], "link": str(target)},
+             lambda p: f"{p['id']}\t{p['link']} -> {p['path']}")
     return 0
 
 
@@ -734,6 +758,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--thumb-size", type=int, default=200, help="thumbnail size lap expects (default 200)")
     s.add_argument("--limit", type=int, help="export only the newest N assets")
     s.set_defaults(fn=cmd_lap_export)
+
+    s = sub.add_parser("lap-fetch", help="fetch the file behind a lap album entry (lap's fetch-on-open command)",
+                       description="Given the path of an entry in the exported lap album, fetches the best rendition "
+                                   "into the cache and points the entry at it. lap runs this when a preview is opened "
+                                   "and the file is not on disk.")
+    s.add_argument("path", help="the entry's path under the album root")
+    s.set_defaults(fn=cmd_lap_fetch)
 
     s = sub.add_parser("faces", help="faces found in photos; assign or clear a person")
     fs = s.add_subparsers(dest="faces_cmd", metavar="action", required=True)
