@@ -2,9 +2,21 @@
 
 ## Status and authorization
 
-This is a design-stage project, created on 2026-09-07. No application has been implemented or tested against the user's iCloud account.
+Implementation started 2026-09-08 on the user's instruction ("start implementing"). What exists, all tested against a fake iCloud (`tests/test_cli.py`, 14 tests) and smoke-tested offline against the real pyicloud with no session:
 
-The user requested this project folder and Markdown handoff following a discussion. This is not authorization to install software, change system or iCloud settings, authenticate to their account, download their library, or publish a GitHub repository. Continue design and research; obtain an implementation instruction before making operational changes.
+- `icloud_photos/` package, command `photos`, installed editable in `.venv` (Python 3.14, aarch64).
+- `adapter.py`: the cloud interface and `ICloudAdapter` over pyicloud 2.7.0 (`PhotosService.all`, `iter_changes`, `sync_cursor`, `PhotoAsset.download(version)`); login delegated to `icloud auth login --session-dir`.
+- `catalog.py`: SQLite catalogue (assets, albums, cache index, collections, meta) with keyset-paged search.
+- `sync.py`: full listing on first run, change feed after, missing-marking, album membership.
+- `cache.py`: budgeted cache with LRU eviction, pinning, refusal with exit 4.
+- `cli.py`: argparse, `--json` everywhere, one-line errors, detached `sync --background`.
+- `README.md`, `systemd/` user service and timer.
+
+Not yet done, and not authorised until the user says so: **logging in to the user's iCloud account and running a sync against the real library**. The one-time `photos login` needs the user at a terminal for the password and two-factor code. After that, the first real steps are `photos sync --limit 200` to look at a sample, then a full sync, then measuring listing time, catalogue size and preview sizes. Nothing so far has been verified against Apple's actual responses; field names for hidden/caption/location come from reading pyicloud's source.
+
+Not started: semantic search, faces, objects, shared library, video sampling. Reuse rule applies (see Decisions): evaluate Immich's machine-learning service, PhotoPrism, rclip and the underlying models (CLIP via open_clip, InsightFace) before writing anything. RAM is 8 GB; that bounds model choice.
+
+Publishing to GitHub still requires an instruction.
 
 ## Decisions (2026-09-08)
 

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icloud-photos-cli"
+version = "0.1.0"
+description = "An assistant-friendly command line for an iCloud photo library: durable catalogue, bounded cache, JSON everywhere."
+requires-python = ">=3.11"
+dependencies = [
+    "pyicloud[cli]>=2.7.0",
+]
+
+[project.scripts]
+photos = "icloud_photos.cli:main"
+
+[tool.setuptools]
+packages = ["icloud_photos"]

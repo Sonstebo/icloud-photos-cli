@@ -6,3 +6,4 @@ originals/
 session/
 .venv/
 __pycache__/
+*.egg-info/

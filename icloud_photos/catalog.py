@@ -1,0 +1,378 @@
+"""The durable local catalogue: SQLite, one file, no ORM.
+
+Holds what is known about every asset, album membership, what the cache has
+on disk, and the user's collections. Queries never touch the network.
+Dates are stored as ISO 8601 UTC text ("2024-05-01T12:00:00+00:00") so
+they sort correctly as strings.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from .adapter import AssetInfo
+
+SCHEMA_VERSION = 1
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS assets (
+    id TEXT PRIMARY KEY,
+    master_id TEXT,
+    filename TEXT,
+    kind TEXT,
+    live INTEGER,
+    taken TEXT,
+    added TEXT,
+    width INTEGER,
+    height INTEGER,
+    bytes INTEGER,
+    favorite INTEGER,
+    caption TEXT,
+    latitude REAL,
+    longitude REAL,
+    hidden INTEGER,
+    versions TEXT,
+    fingerprint TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    missing_since TEXT
+);
+CREATE INDEX IF NOT EXISTS assets_taken ON assets (taken DESC, id);
+CREATE INDEX IF NOT EXISTS assets_master ON assets (master_id);
+CREATE TABLE IF NOT EXISTS albums (id TEXT PRIMARY KEY, name TEXT, fullname TEXT, synced TEXT);
+CREATE TABLE IF NOT EXISTS album_assets (
+    album_id TEXT, asset_id TEXT, PRIMARY KEY (album_id, asset_id));
+CREATE TABLE IF NOT EXISTS cache (
+    asset_id TEXT, version TEXT, path TEXT, bytes INTEGER,
+    fetched TEXT, used TEXT, pinned INTEGER DEFAULT 0,
+    PRIMARY KEY (asset_id, version));
+CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, created TEXT, note TEXT);
+CREATE TABLE IF NOT EXISTS collection_assets (
+    collection TEXT, asset_id TEXT, position INTEGER, note TEXT,
+    PRIMARY KEY (collection, asset_id));
+"""
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def iso(value: datetime | None) -> str | None:
+    return value.astimezone(timezone.utc).isoformat() if value else None
+
+
+def encode_cursor(taken: str | None, asset_id: str) -> str:
+    return base64.urlsafe_b64encode(json.dumps([taken, asset_id]).encode()).decode()
+
+
+def decode_cursor(cursor: str) -> tuple[str | None, str]:
+    try:
+        taken, asset_id = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        return taken, asset_id
+    except Exception as err:  # noqa: BLE001
+        raise ValueError("bad cursor") from err
+
+
+class Catalog:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path, isolation_level=None)  # autocommit; explicit BEGIN below
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.executescript(SCHEMA)
+        if self.get_meta("schema") is None:
+            self.set_meta("schema", str(SCHEMA_VERSION))
+
+    def close(self) -> None:
+        self.db.close()
+
+    # --- meta -------------------------------------------------------------
+    def get_meta(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str | None) -> None:
+        if value is None:
+            self.db.execute("DELETE FROM meta WHERE key=?", (key,))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    # --- assets -----------------------------------------------------------
+    def upsert_asset(self, info: AssetInfo, seen: str | None = None) -> str:
+        """Insert or update; returns 'new', 'changed' or 'same'."""
+        seen = seen or now()
+        fp = info.fingerprint()
+        row = self.db.execute("SELECT fingerprint FROM assets WHERE id=?", (info.id,)).fetchone()
+        if row is None:
+            status = "new"
+        elif row["fingerprint"] != fp:
+            status = "changed"
+        else:
+            status = "same"
+            self.db.execute("UPDATE assets SET last_seen=?, missing_since=NULL WHERE id=?", (seen, info.id))
+            return status
+        self.db.execute(
+            """INSERT INTO assets (id, master_id, filename, kind, live, taken, added, width, height,
+                   bytes, favorite, caption, latitude, longitude, hidden, versions, fingerprint,
+                   first_seen, last_seen, missing_since)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+               ON CONFLICT(id) DO UPDATE SET master_id=excluded.master_id, filename=excluded.filename,
+                   kind=excluded.kind, live=excluded.live, taken=excluded.taken, added=excluded.added,
+                   width=excluded.width, height=excluded.height, bytes=excluded.bytes,
+                   favorite=excluded.favorite, caption=excluded.caption, latitude=excluded.latitude,
+                   longitude=excluded.longitude, hidden=excluded.hidden, versions=excluded.versions,
+                   fingerprint=excluded.fingerprint, last_seen=excluded.last_seen, missing_since=NULL""",
+            (info.id, info.master_id, info.filename, info.kind, int(info.live), iso(info.taken),
+             iso(info.added), info.width, info.height, info.bytes, int(info.favorite), info.caption,
+             info.latitude, info.longitude, int(info.hidden), json.dumps(info.versions), fp, seen, seen),
+        )
+        return status
+
+    def mark_missing(self, asset_id: str, when: str | None = None) -> bool:
+        cur = self.db.execute(
+            "UPDATE assets SET missing_since=COALESCE(missing_since, ?) WHERE id=?", (when or now(), asset_id))
+        return cur.rowcount > 0
+
+    def asset_id_for_master(self, master_id: str) -> str | None:
+        row = self.db.execute("SELECT id FROM assets WHERE master_id=?", (master_id,)).fetchone()
+        return row["id"] if row else None
+
+    def get_asset(self, asset_id: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        return self._asset_dict(row) if row else None
+
+    def asset_ids(self) -> set[str]:
+        return {r["id"] for r in self.db.execute("SELECT id FROM assets")}
+
+    @staticmethod
+    def _asset_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["live"] = bool(d["live"])
+        d["favorite"] = bool(d["favorite"])
+        d["hidden"] = bool(d["hidden"])
+        d["versions"] = json.loads(d["versions"] or "{}")
+        d.pop("fingerprint", None)
+        d["missing"] = d.pop("missing_since") is not None
+        return d
+
+    def counts(self) -> dict[str, int]:
+        q = self.db.execute
+        return {
+            "assets": q("SELECT COUNT(*) FROM assets").fetchone()[0],
+            "images": q("SELECT COUNT(*) FROM assets WHERE kind='image'").fetchone()[0],
+            "movies": q("SELECT COUNT(*) FROM assets WHERE kind='movie'").fetchone()[0],
+            "missing": q("SELECT COUNT(*) FROM assets WHERE missing_since IS NOT NULL").fetchone()[0],
+            "albums": q("SELECT COUNT(*) FROM albums").fetchone()[0],
+            "collections": q("SELECT COUNT(*) FROM collections").fetchone()[0],
+        }
+
+    def search(
+        self,
+        *,
+        text: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        kind: str | None = None,
+        favorite: bool | None = None,
+        album: str | None = None,
+        collection: str | None = None,
+        located: bool | None = None,
+        live: bool | None = None,
+        include_missing: bool = False,
+        include_hidden: bool = False,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Keyset-paged search, newest capture first. Returns (rows, next_cursor)."""
+        where, args = [], []
+        if not include_missing:
+            where.append("a.missing_since IS NULL")
+        if not include_hidden:
+            where.append("a.hidden = 0")
+        if text:
+            where.append("(a.filename LIKE ? OR a.caption LIKE ?)")
+            args += [f"%{text}%", f"%{text}%"]
+        if since:
+            where.append("a.taken >= ?"); args.append(since)
+        if until:
+            where.append("a.taken < ?"); args.append(until)
+        if kind:
+            where.append("a.kind = ?"); args.append(kind)
+        if favorite is not None:
+            where.append("a.favorite = ?"); args.append(int(favorite))
+        if live is not None:
+            where.append("a.live = ?"); args.append(int(live))
+        if located is not None:
+            where.append("a.latitude IS " + ("NOT NULL" if located else "NULL"))
+        if album:
+            where.append(
+                "a.id IN (SELECT asset_id FROM album_assets aa JOIN albums al ON al.id = aa.album_id "
+                "WHERE al.id = ? OR al.name = ? OR al.fullname = ?)")
+            args += [album, album, album]
+        if collection:
+            where.append("a.id IN (SELECT asset_id FROM collection_assets WHERE collection = ?)")
+            args.append(collection)
+        if cursor:
+            taken, asset_id = decode_cursor(cursor)
+            # rows sort by (taken DESC, id DESC); NULL taken sorts last in DESC order
+            if taken is None:
+                where.append("a.taken IS NULL AND a.id < ?"); args.append(asset_id)
+            else:
+                where.append("(a.taken < ? OR (a.taken = ? AND a.id < ?) OR a.taken IS NULL)")
+                args += [taken, taken, asset_id]
+        sql = "SELECT a.* FROM assets a"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY a.taken DESC, a.id DESC LIMIT ?"
+        args.append(limit + 1)
+        rows = [self._asset_dict(r) for r in self.db.execute(sql, args)]
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            last = rows[-1]
+            next_cursor = encode_cursor(last["taken"], last["id"])
+        return rows, next_cursor
+
+    # --- albums -----------------------------------------------------------
+    def replace_albums(self, albums: Iterable[tuple[str, str, str]]) -> None:
+        albums = list(albums)
+        self.db.execute("BEGIN")
+        self.db.execute("DELETE FROM albums")
+        self.db.executemany(
+            "INSERT INTO albums (id, name, fullname) VALUES (?, ?, ?)", albums)
+        keep = [a[0] for a in albums]
+        if keep:
+            self.db.execute(
+                f"DELETE FROM album_assets WHERE album_id NOT IN ({','.join('?' * len(keep))})", keep)
+        else:
+            self.db.execute("DELETE FROM album_assets")
+        self.db.execute("COMMIT")
+
+    def replace_album_members(self, album_id: str, asset_ids: Iterable[str]) -> int:
+        ids = list(asset_ids)
+        self.db.execute("BEGIN")
+        self.db.execute("DELETE FROM album_assets WHERE album_id=?", (album_id,))
+        self.db.executemany(
+            "INSERT OR IGNORE INTO album_assets (album_id, asset_id) VALUES (?, ?)",
+            [(album_id, i) for i in ids])
+        self.db.execute("UPDATE albums SET synced=? WHERE id=?", (now(), album_id))
+        self.db.execute("COMMIT")
+        return len(ids)
+
+    def albums(self) -> list[dict[str, Any]]:
+        return [dict(r) | {"count": c} for r, c in (
+            (r, self.db.execute("SELECT COUNT(*) FROM album_assets WHERE album_id=?", (r["id"],)).fetchone()[0])
+            for r in self.db.execute("SELECT * FROM albums ORDER BY fullname"))]
+
+    def find_album(self, key: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM albums WHERE id=? OR name=? OR fullname=?", (key, key, key)).fetchone()
+        return dict(row) if row else None
+
+    # --- cache ------------------------------------------------------------
+    def cache_get(self, asset_id: str, version: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT * FROM cache WHERE asset_id=? AND version=?", (asset_id, version)).fetchone()
+        return dict(row) if row else None
+
+    def cache_put(self, asset_id: str, version: str, path: str, size: int, pinned: bool = False) -> None:
+        t = now()
+        self.db.execute(
+            """INSERT INTO cache (asset_id, version, path, bytes, fetched, used, pinned)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(asset_id, version) DO UPDATE SET path=excluded.path, bytes=excluded.bytes,
+                   fetched=excluded.fetched, used=excluded.used, pinned=MAX(cache.pinned, excluded.pinned)""",
+            (asset_id, version, path, size, t, t, int(pinned)))
+
+    def cache_touch(self, asset_id: str, version: str) -> None:
+        self.db.execute("UPDATE cache SET used=? WHERE asset_id=? AND version=?", (now(), asset_id, version))
+
+    def cache_pin(self, asset_id: str, version: str | None, pinned: bool) -> int:
+        if version:
+            cur = self.db.execute(
+                "UPDATE cache SET pinned=? WHERE asset_id=? AND version=?", (int(pinned), asset_id, version))
+        else:
+            cur = self.db.execute("UPDATE cache SET pinned=? WHERE asset_id=?", (int(pinned), asset_id))
+        return cur.rowcount
+
+    def cache_delete(self, asset_id: str, version: str) -> None:
+        self.db.execute("DELETE FROM cache WHERE asset_id=? AND version=?", (asset_id, version))
+
+    def cache_rows(self, *, asset_id: str | None = None, unpinned_only: bool = False,
+                   oldest_first: bool = False) -> list[dict[str, Any]]:
+        where, args = [], []
+        if asset_id:
+            where.append("asset_id=?"); args.append(asset_id)
+        if unpinned_only:
+            where.append("pinned=0")
+        sql = "SELECT * FROM cache"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY used ASC" if oldest_first else " ORDER BY asset_id, version"
+        return [dict(r) for r in self.db.execute(sql, args)]
+
+    def cache_usage(self) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(bytes),0) b, COALESCE(SUM(CASE WHEN pinned THEN bytes ELSE 0 END),0) p "
+            "FROM cache").fetchone()
+        by_version = {r["version"]: {"files": r["n"], "bytes": r["b"]} for r in self.db.execute(
+            "SELECT version, COUNT(*) n, COALESCE(SUM(bytes),0) b FROM cache GROUP BY version")}
+        return {"files": row["n"], "bytes": row["b"], "pinned_bytes": row["p"], "by_version": by_version}
+
+    # --- collections ------------------------------------------------------
+    def collection_create(self, name: str, note: str | None = None) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO collections (name, created, note) VALUES (?, ?, ?)", (name, now(), note))
+        return cur.rowcount > 0
+
+    def collection_delete(self, name: str) -> bool:
+        self.db.execute("BEGIN")
+        self.db.execute("DELETE FROM collection_assets WHERE collection=?", (name,))
+        cur = self.db.execute("DELETE FROM collections WHERE name=?", (name,))
+        self.db.execute("COMMIT")
+        return cur.rowcount > 0
+
+    def collection_exists(self, name: str) -> bool:
+        return self.db.execute("SELECT 1 FROM collections WHERE name=?", (name,)).fetchone() is not None
+
+    def collection_add(self, name: str, asset_ids: Iterable[str], note: str | None = None) -> int:
+        pos = self.db.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM collection_assets WHERE collection=?", (name,)).fetchone()[0]
+        added = 0
+        for asset_id in asset_ids:
+            pos += 1
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO collection_assets (collection, asset_id, position, note) VALUES (?,?,?,?)",
+                (name, asset_id, pos, note))
+            added += cur.rowcount
+        return added
+
+    def collection_remove(self, name: str, asset_ids: Iterable[str]) -> int:
+        removed = 0
+        for asset_id in asset_ids:
+            removed += self.db.execute(
+                "DELETE FROM collection_assets WHERE collection=? AND asset_id=?", (name, asset_id)).rowcount
+        return removed
+
+    def collections(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT c.name, c.created, c.note, COUNT(ca.asset_id) AS count FROM collections c "
+            "LEFT JOIN collection_assets ca ON ca.collection = c.name GROUP BY c.name ORDER BY c.name")]
+
+    def collection_items(self, name: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT ca.position, ca.note, a.* FROM collection_assets ca JOIN assets a ON a.id = ca.asset_id "
+            "WHERE ca.collection=? ORDER BY ca.position", (name,))
+        out = []
+        for r in rows:
+            d = self._asset_dict(r)
+            d["position"], d["note"] = r["position"], r["note"]
+            out.append(d)
+        return out
