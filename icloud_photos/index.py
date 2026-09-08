@@ -76,12 +76,33 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
     seeds = SeedIndex(catalog.seeds())
     chunks = [todo[i:i + batch] for i in range(0, len(todo), batch)]
 
+    def rendition(a: dict[str, Any]) -> str | None:
+        """The rendition to analyse: the pass's own, else a medium preview, else a small
+        original; None for what iCloud offers no usable image of (RAW files, typically)."""
+        versions = a.get("versions") or {}
+        if isinstance(versions, str):
+            versions = json.loads(versions)
+        if source in versions:
+            return source
+        if "medium" in versions:
+            return "medium"
+        original = versions.get("original") or {}
+        if (original.get("bytes") or 0) <= 8 * 1024 * 1024 and "raw" not in (original.get("type") or ""):
+            return "original"
+        return None
+
+    used: dict[str, str] = {}   # asset id -> the rendition it was analysed from
+
     def prepare(chunk: list[dict[str, Any]]) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
         """Main thread: what the cache already has, and what must be downloaded."""
         images: dict[str, np.ndarray] = {}
         need = []
         for a in chunk:
-            path = cache.get(a["id"], source)
+            version = rendition(a)
+            if version is None:
+                continue
+            used[a["id"]] = version
+            path = cache.get(a["id"], version)
             if path is not None:
                 img = decode_image(path.read_bytes())
                 if img is not None:
@@ -91,9 +112,12 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
         return images, need
 
     def download(need: list[dict[str, Any]]) -> list[tuple[str, bytes]]:
-        """Worker thread: network only, no catalogue access."""
-        return [(asset_id, data) for asset_id, data in
-                adapter.download_many([(a["id"], a["master_id"]) for a in need], source) if data is not None]
+        """Worker thread: network only, no catalogue access; one batch per rendition."""
+        out: list[tuple[str, bytes]] = []
+        for version in sorted({used[a["id"]] for a in need}):
+            items = [(a["id"], a["master_id"]) for a in need if used[a["id"]] == version]
+            out += [(asset_id, data) for asset_id, data in adapter.download_many(items, version) if data is not None]
+        return out
 
     from concurrent.futures import ThreadPoolExecutor
     pool = ThreadPoolExecutor(max_workers=1)     # the next chunk downloads while this one is analysed
@@ -114,11 +138,16 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
             images[asset_id] = img
             result["fetched"] += 1
             try:
-                cache.put(asset_id, source, data, ".jpg")
+                cache.put(asset_id, used[asset_id], data, ".jpg")
             except BudgetExceeded:
                 pass   # indexing does not need the file kept
         catalog.db.execute("BEGIN")
         for a in chunk:
+            if a["id"] not in used:
+                # nothing to analyse; recorded so the asset is not retried every run
+                catalog.set_index_state(a["id"], models.clip_name, models.face_name, "none", 0)
+                result["skipped"] = result.get("skipped", 0) + 1
+                continue
             img = images.get(a["id"])
             if img is None:
                 result["failed"] += 1
@@ -129,8 +158,8 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
                 person, sim = seeds.match(from_blob(f["embedding"]), threshold)
                 f["person_id"], f["similarity"] = person, sim
                 result["named"] += bool(person)
-            catalog.put_faces(a["id"], faces, source)
-            catalog.set_index_state(a["id"], models.clip_name, models.face_name, source, len(faces))
+            catalog.put_faces(a["id"], faces, used[a["id"]])
+            catalog.set_index_state(a["id"], models.clip_name, models.face_name, used[a["id"]], len(faces))
             result["done"] += 1
             result["faces"] += len(faces)
         catalog.set_meta("index_progress", json.dumps(result))
