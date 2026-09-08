@@ -6,6 +6,12 @@ This is a design-stage project, created on 2026-09-07. No application has been i
 
 The user requested this project folder and Markdown handoff following a discussion. This is not authorization to install software, change system or iCloud settings, authenticate to their account, download their library, or publish a GitHub repository. Continue design and research; obtain an implementation instruction before making operational changes.
 
+## Decisions (2026-09-08)
+
+- **Reuse before building.** Do not implement anything an existing open-source project already provides: iCloud access, catalogue, thumbnailing, face/object models, vector search. Survey candidates first, verify them on this machine, and write only the glue and whatever is genuinely missing. Say explicitly when something has to be built because no candidate fits.
+- **CLI, not MCP.** The interface for assistants, scripts and the user is a command-line tool with `--json` output, stable asset IDs, errors on stderr and non-zero exits. No MCP server; a wrapper can be added later if a client without shell access needs it.
+- The CLI is the interface, not the whole program. Indexing and preview fetching run in a resumable background worker; the CLI reads and writes the local catalogue and never blocks a query on the network.
+
 ## User's goal
 
 Provide a Linux photo experience that keeps full-resolution originals in iCloud, limits local storage, and makes the library useful to AI assistants for photobooks, slideshows, search, and other creative projects.
