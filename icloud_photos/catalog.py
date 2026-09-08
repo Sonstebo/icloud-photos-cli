@@ -51,6 +51,15 @@ CREATE TABLE IF NOT EXISTS cache (
     asset_id TEXT, version TEXT, path TEXT, bytes INTEGER,
     fetched TEXT, used TEXT, pinned INTEGER DEFAULT 0,
     PRIMARY KEY (asset_id, version));
+CREATE TABLE IF NOT EXISTS records (
+    name TEXT PRIMARY KEY, type TEXT, deleted INTEGER, modified TEXT, master_ref TEXT, json TEXT);
+CREATE INDEX IF NOT EXISTS records_master_ref ON records (master_ref);
+CREATE INDEX IF NOT EXISTS records_type ON records (type);
+CREATE TABLE IF NOT EXISTS people (
+    id TEXT PRIMARY KEY, name TEXT, display_name TEXT, verified INTEGER, kind INTEGER, modified TEXT, deleted INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS face_crops (
+    id TEXT PRIMARY KEY, person_id TEXT, kind INTEGER, bytes INTEGER, modified TEXT, deleted INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS face_crops_person ON face_crops (person_id);
 CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, created TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS collection_assets (
     collection TEXT, asset_id TEXT, position INTEGER, note TEXT,
@@ -116,24 +125,92 @@ class Catalog:
             status = "changed"
         else:
             status = "same"
-            self.db.execute("UPDATE assets SET last_seen=?, missing_since=NULL WHERE id=?", (seen, info.id))
+            self.db.execute("UPDATE assets SET last_seen=? WHERE id=?", (seen, info.id))
             return status
         self.db.execute(
             """INSERT INTO assets (id, master_id, filename, kind, live, taken, added, width, height,
                    bytes, favorite, caption, latitude, longitude, hidden, versions, fingerprint,
                    first_seen, last_seen, missing_since)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET master_id=excluded.master_id, filename=excluded.filename,
                    kind=excluded.kind, live=excluded.live, taken=excluded.taken, added=excluded.added,
                    width=excluded.width, height=excluded.height, bytes=excluded.bytes,
                    favorite=excluded.favorite, caption=excluded.caption, latitude=excluded.latitude,
                    longitude=excluded.longitude, hidden=excluded.hidden, versions=excluded.versions,
-                   fingerprint=excluded.fingerprint, last_seen=excluded.last_seen, missing_since=NULL""",
+                   fingerprint=excluded.fingerprint, last_seen=excluded.last_seen,
+                   missing_since=CASE WHEN excluded.missing_since IS NULL THEN NULL ELSE COALESCE(assets.missing_since, excluded.missing_since) END""",
             (info.id, info.master_id, info.filename, info.kind, int(info.live), iso(info.taken),
              iso(info.added), info.width, info.height, info.bytes, int(info.favorite), info.caption,
-             info.latitude, info.longitude, int(info.hidden), json.dumps(info.versions), fp, seen, seen),
+             info.latitude, info.longitude, int(info.hidden), json.dumps(info.versions), fp, seen, seen,
+             seen if info.deleted else None),
         )
         return status
+
+    # --- raw records --------------------------------------------------------
+    def put_record(self, name: str, rtype: str | None, deleted: bool, modified: str | None,
+                   master_ref: str | None, payload: dict[str, Any] | None) -> None:
+        self.db.execute(
+            """INSERT INTO records (name, type, deleted, modified, master_ref, json) VALUES (?,?,?,?,?,?)
+               ON CONFLICT(name) DO UPDATE SET type=COALESCE(excluded.type, records.type), deleted=excluded.deleted,
+                   modified=COALESCE(excluded.modified, records.modified),
+                   master_ref=COALESCE(excluded.master_ref, records.master_ref),
+                   json=CASE WHEN excluded.json IS NULL THEN records.json ELSE excluded.json END""",
+            (name, rtype, int(deleted), modified, master_ref, json.dumps(payload) if payload is not None else None))
+
+    def get_record(self, name: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM records WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["json"] = json.loads(d["json"]) if d["json"] else None
+        return d
+
+    def assets_of_master(self, master_name: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM records WHERE master_ref=? AND type='CPLAsset' AND deleted=0", (master_name,))
+        out = []
+        for row in rows:
+            d = dict(row); d["json"] = json.loads(d["json"]) if d["json"] else None
+            out.append(d)
+        return out
+
+    def record_counts(self) -> dict[str, int]:
+        return {r["type"] or "tombstone": r["n"] for r in self.db.execute(
+            "SELECT type, COUNT(*) n FROM records WHERE deleted=0 GROUP BY type")}
+
+    # --- album membership from container relations --------------------------
+    def set_relation(self, container_id: str, item_id: str, deleted: bool) -> None:
+        if deleted:
+            self.db.execute("DELETE FROM album_assets WHERE album_id=? AND asset_id=?", (container_id, item_id))
+        else:
+            self.db.execute("INSERT OR IGNORE INTO album_assets (album_id, asset_id) VALUES (?, ?)",
+                            (container_id, item_id))
+
+    # --- people -------------------------------------------------------------
+    def put_person(self, pid: str, name: str | None, display: str | None, verified: bool, kind: int | None,
+                   modified: str | None, deleted: bool = False) -> None:
+        self.db.execute(
+            """INSERT INTO people (id, name, display_name, verified, kind, modified, deleted) VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name, display_name=excluded.display_name,
+                   verified=excluded.verified, kind=excluded.kind, modified=excluded.modified, deleted=excluded.deleted""",
+            (pid, name, display, int(verified), kind, modified, int(deleted)))
+
+    def put_face_crop(self, fid: str, person_id: str | None, kind: int | None, size: int | None,
+                      modified: str | None, deleted: bool = False) -> None:
+        self.db.execute(
+            """INSERT INTO face_crops (id, person_id, kind, bytes, modified, deleted) VALUES (?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET person_id=excluded.person_id, kind=excluded.kind, bytes=excluded.bytes,
+                   modified=excluded.modified, deleted=excluded.deleted""",
+            (fid, person_id, kind, size, modified, int(deleted)))
+
+    def mark_deleted(self, table: str, key: str) -> bool:
+        assert table in ("people", "face_crops")
+        return self.db.execute(f"UPDATE {table} SET deleted=1 WHERE id=?", (key,)).rowcount > 0
+
+    def people(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT p.*, (SELECT COUNT(*) FROM face_crops f WHERE f.person_id = p.id AND f.deleted=0) AS face_crops "
+            "FROM people p WHERE p.deleted=0 ORDER BY p.verified DESC, p.name")]
 
     def mark_missing(self, asset_id: str, when: str | None = None) -> bool:
         cur = self.db.execute(
@@ -171,6 +248,7 @@ class Catalog:
             "missing": q("SELECT COUNT(*) FROM assets WHERE missing_since IS NOT NULL").fetchone()[0],
             "albums": q("SELECT COUNT(*) FROM albums").fetchone()[0],
             "collections": q("SELECT COUNT(*) FROM collections").fetchone()[0],
+            "people": q("SELECT COUNT(*) FROM people WHERE deleted=0").fetchone()[0],
         }
 
     def search(
@@ -247,12 +325,6 @@ class Catalog:
         self.db.execute("DELETE FROM albums")
         self.db.executemany(
             "INSERT INTO albums (id, name, fullname) VALUES (?, ?, ?)", albums)
-        keep = [a[0] for a in albums]
-        if keep:
-            self.db.execute(
-                f"DELETE FROM album_assets WHERE album_id NOT IN ({','.join('?' * len(keep))})", keep)
-        else:
-            self.db.execute("DELETE FROM album_assets")
         self.db.execute("COMMIT")
 
     def replace_album_members(self, album_id: str, asset_ids: Iterable[str]) -> int:

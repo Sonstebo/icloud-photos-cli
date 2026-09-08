@@ -6,6 +6,7 @@ cloud. Nothing here needs the network or a session.
 """
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -18,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from icloud_photos import cli
-from icloud_photos.adapter import AlbumInfo, AssetInfo, Change
+from icloud_photos.adapter import AlbumInfo, AssetInfo, RawRecord
 
 ROOT = Path(__file__).resolve().parent.parent
 T0 = datetime(2019, 7, 20, 12, 0, tzinfo=timezone.utc)
@@ -38,43 +39,86 @@ def make_asset(n: int, **over) -> AssetInfo:
     return AssetInfo(**base)
 
 
+def b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+def rec(name: str, rtype: str, **fields) -> RawRecord:
+    """A raw record in CloudKit's JSON shape: fields are {name: {value: ...}}."""
+    return RawRecord(name, rtype, False, T0, {"recordName": name, "recordType": rtype,
+                                              "fields": {k: {"value": v} for k, v in fields.items()}})
+
+
+def tombstone(name: str) -> RawRecord:
+    return RawRecord(name, None, True, None)
+
+
 class FakeCloud:
-    """Pretends to be iCloud. Downloads return `size` bytes of filler."""
+    """Pretends to be iCloud's photo zone.
+
+    `library` holds AssetInfo objects; the zone feed presents each as a
+    CPLMaster and a CPLAsset record (master first or asset first, both
+    happen for real). `pending` is what the next incremental sync will see.
+    Downloads return `bytes` bytes of filler.
+    """
 
     def __init__(self) -> None:
         self.assets: dict[str, AssetInfo] = {}
-        self.cursor = "c1"
-        self.pending: list[Change] = []
+        self.token = 0
+        self.pending: list[RawRecord] = []
         self.downloads: list[tuple[str, str]] = []
         self.album_list = [AlbumInfo("alb1", "Trip", "Trip"), AlbumInfo("alb2", "Family", "Folder/Family")]
-        self.album_members = {"alb1": [], "alb2": []}
+        self.relations: list[tuple[str, str]] = []
+        self.people: list[tuple[str, str, str]] = [("p1", "Thea-Oline", "Thea-Oline"), ("p2", "Ingjerd Thürmer", "Ingjerd")]
+        self.face_crops: list[tuple[str, str]] = [("fc1", "p1"), ("fc2", "p1"), ("fc3", "p2")]
         self.logged_in = True
+        self.page_size = 5
 
     def add(self, *assets: AssetInfo) -> None:
         for a in assets:
             self.assets[a.id] = a
 
-    def bump(self, *changes: Change) -> None:
-        self.pending += changes
-        self.cursor = f"c{int(self.cursor[1:]) + 1}"
+    def records_for(self, a: AssetInfo, master_first: bool = True) -> list[RawRecord]:
+        master = rec(a.master_id, "CPLMaster", filenameEnc=b64(a.filename))
+        asset = rec(a.id, "CPLAsset", masterRef={"recordName": a.master_id}, isFavorite=int(a.favorite),
+                    isHidden=int(a.hidden), isDeleted=int(a.deleted))
+        return [master, asset] if master_first else [asset, master]
+
+    def whole_zone(self) -> list[RawRecord]:
+        out = []
+        for n, a in enumerate(sorted(self.assets.values(), key=lambda a: a.taken)):
+            out += self.records_for(a, master_first=(n % 2 == 0))
+        out += [rec(f"{i}-IN-{c}", "CPLContainerRelation", itemId=i, containerId=c, position=n * 1024)
+                for n, (c, i) in enumerate(self.relations)]
+        out += [rec(pid, "CPLPerson", personFullNameEnc=b64(full), displayName=b64(disp), verifiedType=1, personType=0)
+                for pid, full, disp in self.people]
+        out += [rec(fid, "CPLFaceCrop", personRef={"recordName": pid}, type=5, resFaceCropFileSize=15000)
+                for fid, pid in self.face_crops]
+        out.append(rec("mem1", "CPLMemory", title=b64("Majorca")))   # a type the sync ignores
+        return out
+
+    def push(self, *records: RawRecord) -> None:
+        self.pending += records
 
     # --- Adapter ---
     def auth_status(self):
         return {"authenticated": self.logged_in, "username": "fake@example.com"}
 
-    def sync_cursor(self):
-        return self.cursor
+    def iter_zone(self, since):
+        records = self.whole_zone() if since is None else self.pending
+        if since is not None:
+            self.pending = []
+        for i in range(0, len(records), self.page_size):
+            self.token += 1
+            yield records[i:i + self.page_size], f"t{self.token}"
+        if not records:
+            return
 
-    def iter_assets(self):
-        for a in sorted(self.assets.values(), key=lambda a: a.taken, reverse=True):
-            yield a
-
-    def get_asset(self, asset_id):
-        return self.assets.get(asset_id)
-
-    def changes_since(self, cursor):
-        out, self.pending = self.pending, []
-        return out, self.cursor
+    def asset_from_records(self, asset, master):
+        info = self.assets[asset.name]
+        # what a real adapter would derive from the records rather than remember
+        info.favorite = bool(asset.value("isFavorite"))
+        return info
 
     def download(self, asset_id, version):
         a = self.assets.get(asset_id)
@@ -85,9 +129,6 @@ class FakeCloud:
 
     def albums(self):
         return list(self.album_list)
-
-    def iter_album_asset_ids(self, album_id):
-        yield from self.album_members.get(album_id, [])
 
 
 def stub_record(**fields):
@@ -136,7 +177,7 @@ class CliTest(unittest.TestCase):
             "original": {"bytes": 50_000_000, "type": "com.apple.quicktime-movie", "filename": "IMG_0009.MOV"},
             "thumb_image": {"bytes": 20_000, "type": "public.jpeg", "filename": "IMG_0009.JPG"},
         }))
-        self.cloud.album_members["alb1"] = ["A001/x+y==", "A002/x+y=="]
+        self.cloud.relations = [("alb1", "A001/x+y=="), ("alb1", "A002/x+y==")]
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -154,48 +195,79 @@ class CliTest(unittest.TestCase):
         return json.loads(out) if out.strip() else None, err
 
     # --- sync and search ---------------------------------------------------
-    def test_first_sync_lists_everything_then_the_change_feed_takes_over(self):
-        r, _ = self.j("sync", "--albums")
-        self.assertEqual((r["mode"], r["listed"], r["new"], r["albums"]), ("full", 8, 8, 2))
-        self.assertEqual(r["cursor_after"], "c1")
-        # nothing changed: no listing at all
+    def test_first_sync_walks_the_zone_then_the_change_feed_takes_over(self):
         r, _ = self.j("sync")
-        self.assertEqual((r["mode"], r["listed"]), ("unchanged", 0))
-        # an edit and a deletion arrive through the change feed
+        self.assertEqual((r["mode"], r["new"], r["relations"], r["people"], r["face_crops"], r["albums"]),
+                         ("full", 8, 2, 2, 3, 2))
+        self.assertEqual(self.j("status", "--offline")[0]["catalog"]["people"], 2)
+        # nothing changed: no pages at all
+        r, _ = self.j("sync")
+        self.assertEqual((r["mode"], r["pages"], r["records"]), ("changes", 0, 0))
+        # an edit, a deletion, a relation gone and a new person arrive through the feed
         self.cloud.assets["A002/x+y=="].caption = "renamed"
-        del self.cloud.assets["A006/x+y=="]
-        self.cloud.bump(Change("A002/x+y==", "CPLAsset", False), Change("A006/x+y==", None, True))
+        edited = self.cloud.records_for(self.cloud.assets["A002/x+y=="])[1]
+        self.cloud.push(edited, tombstone("A006/x+y=="), tombstone("A001/x+y==-IN-alb1"),
+                        rec("p3", "CPLPerson", personFullNameEnc=b64("Morfar"), displayName=b64("Morfar"), verifiedType=0, personType=0))
         r, _ = self.j("sync")
-        self.assertEqual((r["mode"], r["events"], r["changed"], r["missing"]), ("changes", 2, 1, 1))
-        self.assertEqual(r["cursor_after"], "c2")
-        info, _ = self.j("info", "A002/x+y==")
-        self.assertEqual(info["caption"], "renamed")
-        # the deleted one is kept, marked, and out of default searches
+        self.assertEqual((r["mode"], r["records"], r["changed"], r["missing"], r["tombstones"], r["people"]),
+                         ("changes", 4, 1, 1, 2, 1))
+        self.assertEqual(self.j("info", "A002/x+y==")[0]["caption"], "renamed")
         info, _ = self.j("info", "A006/x+y==")
         self.assertTrue(info["missing"])
         res, _ = self.j("search")
         self.assertNotIn("A006/x+y==", [a["id"] for a in res["results"]])
         res, _ = self.j("search", "--include-missing")
         self.assertIn("A006/x+y==", [a["id"] for a in res["results"]])
+        self.assertEqual([a["id"] for a in self.j("search", "--album", "Trip")[0]["results"]], ["A002/x+y=="])
+        people, _ = self.j("people")
+        self.assertEqual([(p["name"], p["face_crops"], bool(p["verified"])) for p in people],
+                         [("Ingjerd Thürmer", 1, True), ("Thea-Oline", 2, True), ("Morfar", 0, False)])
 
-    def test_a_master_change_is_mapped_to_its_asset(self):
+    def test_an_asset_arriving_before_its_master_is_still_paired(self):
+        # whole_zone alternates master-first and asset-first; every asset must land
         self.j("sync")
-        self.cloud.assets["A001/x+y=="].width = 100
-        self.cloud.bump(Change("M001", "CPLMaster", False))
+        self.assertEqual(self.j("status", "--offline")[0]["catalog"]["assets"], 8)
+        # a master edited later re-derives its asset
+        a = self.cloud.assets["A001/x+y=="]; a.width = 100
+        self.cloud.push(self.cloud.records_for(a)[0])
         r, _ = self.j("sync")
         self.assertEqual(r["changed"], 1)
         self.assertEqual(self.j("info", "A001/x+y==")[0]["width"], 100)
 
-    def test_full_listing_marks_what_vanished_and_a_limited_one_does_not(self):
+    def test_an_interrupted_sync_resumes_from_the_last_committed_page(self):
+        class Boom(Exception):
+            pass
+        real = self.cloud.iter_zone
+        def flaky(since):
+            for n, page in enumerate(real(since)):
+                if n == 2:
+                    raise Boom()
+                yield page
+        self.cloud.iter_zone = flaky
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(Boom):
+                cli.main(["--json", "sync"], adapter_factory=lambda app: self.cloud)
+        s, _ = self.j("status", "--offline")
+        self.assertIsNotNone(s["sync_progress"])
+        self.assertEqual(s["sync_progress"]["pages"], 2)
+        self.cloud.iter_zone = real
+        # the fake's incremental feed is `pending`, so hand it the rest of the zone
+        self.cloud.pending = self.cloud.whole_zone()[2 * self.cloud.page_size:]
+        r, _ = self.j("sync")
+        self.assertTrue(r["resumed"])
+        self.assertEqual(self.j("status", "--offline")[0]["catalog"]["assets"], 8)
+
+    def test_a_recently_deleted_asset_is_missing_and_hidden_is_hidden(self):
+        self.cloud.add(make_asset(30, deleted=True), make_asset(31, hidden=True))
         self.j("sync")
-        del self.cloud.assets["A007/x+y=="]
-        r, _ = self.j("sync", "--full", "--limit", "3")
-        self.assertEqual((r["listed"], r["missing"]), (3, 0))
-        r, _ = self.j("sync", "--full")
-        self.assertEqual(r["missing"], 1)
+        ids = [a["id"] for a in self.j("search", "--limit", "100")[0]["results"]]
+        self.assertNotIn("A030/x+y==", ids); self.assertNotIn("A031/x+y==", ids)
+        self.assertIn("A031/x+y==", [a["id"] for a in self.j("search", "--include-hidden", "--limit", "100")[0]["results"]])
+        self.assertTrue(self.j("info", "A030/x+y==")[0]["missing"])
 
     def test_search_filters_and_pages_newest_first(self):
-        self.j("sync", "--albums")
+        self.j("sync")
         res, _ = self.j("search", "--limit", "3")
         ids = [a["id"] for a in res["results"]]
         self.assertEqual(ids, ["A009/x+y==", "A007/x+y==", "A006/x+y=="])

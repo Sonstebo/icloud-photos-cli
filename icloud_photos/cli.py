@@ -180,13 +180,13 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
             "auth:     " + ("ok" if p["authenticated"] else "not logged in" if p["auth"].get("checked")
                             else "not checked") + (f" ({p['auth']['reason']})" if p["auth"].get("reason") else ""),
             f"catalog:  {c['assets']} assets ({c['images']} images, {c['movies']} movies, {c['missing']} missing), "
-            f"{c['albums']} albums, {c['collections']} collections",
+            f"{c['albums']} albums, {c['people']} people, {c['collections']} collections",
             f"cache:    {human_bytes(u['bytes'])} of {human_bytes(u['budget_bytes'])} in {u['files']} files, "
             f"{human_bytes(u['pinned_bytes'])} pinned",
         ]
         if p["last_sync"]:
             ls = p["last_sync"]
-            lines.append(f"last sync: {ls.get('finished')} mode={ls.get('mode')} listed={ls.get('listed')} "
+            lines.append(f"last sync: {ls.get('finished')} mode={ls.get('mode')} records={ls.get('records')} "
                          f"new={ls.get('new')} changed={ls.get('changed')} missing={ls.get('missing')}")
         else:
             lines.append("last sync: never (run `photos sync`)")
@@ -215,9 +215,7 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
     if (pid := _sync_pid(app)) is not None:
         raise CliError("sync-running", f"a sync is already running (pid {pid}); see `photos status`")
     if args.background:
-        flags = [f for f, on in (("--full", args.full), ("--albums", args.albums)) if on]
-        if args.limit:
-            flags += ["--limit", str(args.limit)]
+        flags = ["--full"] if args.full else []
         log = app.paths.sync_log.open("ab")
         proc = subprocess.Popen(
             [sys.executable, "-m", "icloud_photos", "--json", "sync", *flags],
@@ -229,15 +227,24 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
     app.paths.sync_lock.write_text(str(os.getpid()))
     try:
         def progress(p: dict[str, Any]) -> None:
-            if not app.json:
-                print(f"  listed {p.get('listed', 0)} new {p.get('new', 0)} changed {p.get('changed', 0)}",
-                      file=sys.stderr)
-        result = run_sync(app.catalog, app.adapter, full=args.full, limit=args.limit,
-                          albums=args.albums, progress=progress)
+            if not app.json and p["pages"] % 20 == 0:
+                print(f"  records {p['records']} assets new {p['new']} changed {p['changed']} "
+                      f"relations {p['relations']} people {p['people']}", file=sys.stderr)
+        result = run_sync(app.catalog, app.adapter, full=args.full, progress=progress)
     finally:
         app.paths.sync_lock.unlink(missing_ok=True)
-    app.emit(result, lambda r: f"sync {r['mode']}: listed {r['listed']}, new {r['new']}, changed {r['changed']}, "
-                               f"missing {r['missing']}, albums {r['albums']}")
+    app.emit(result, lambda r: f"sync {r['mode']}: {r['records']} records; assets new {r['new']}, changed {r['changed']}, "
+                               f"missing {r['missing']}; relations {r['relations']}, people {r['people']}, "
+                               f"face crops {r['face_crops']}, albums {r['albums']}")
+    return 0
+
+
+def cmd_people(app: App, args: argparse.Namespace) -> int:
+    rows = app.catalog.people()
+    app.emit(rows, lambda rs: "\n".join(
+        f"{r['face_crops']:>4}  {r['name'] or '(unnamed)'}" + (f"  ({r['display_name']})" if r['display_name'] and r['display_name'] != r['name'] else "")
+        + ("" if r['verified'] else "  unverified") + f"  {r['id']}" for r in rs)
+        or "no people in the catalogue yet; run `photos sync`")
     return 0
 
 
@@ -422,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="typical session:\n"
                "  photos login                      once, interactive (password + two-factor code)\n"
-               "  photos sync --albums --background then `photos status` until it finishes\n"
+               "  photos sync --background          then `photos status` until it finishes\n"
                "  photos search beach --since 2019-07 --until 2019-08 --json\n"
                "  photos show <id> <id>             fetch small previews, print their paths\n"
                "  photos original <id> --pin        fetch the full file and keep it\n"
@@ -444,17 +451,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("sync", help="bring the catalogue up to date with the library",
-                       description="First run lists the whole library (metadata only, no images). Later runs read "
-                                   "iCloud's change feed and refetch only what changed. Safe to interrupt; "
-                                   "progress is committed as it goes.")
-    s.add_argument("--full", action="store_true", help="list everything again instead of using the change feed")
-    s.add_argument("--albums", action="store_true", help="also refresh album names and membership (slower)")
-    s.add_argument("--limit", type=int, metavar="N", help="stop after N assets (a first look at the newest; leaves the cursor unset)")
+                       description="Walks iCloud's change feed: the whole photo zone the first time (metadata only, "
+                                   "no images; assets, albums, people, face crops), only what changed after that. "
+                                   "Safe to interrupt: an interrupted run resumes where it stopped.")
+    s.add_argument("--full", action="store_true", help="start from the beginning of the zone again")
     s.add_argument("--background", action="store_true", help="run detached; follow with `photos status`")
     s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("albums", help="list albums known to the catalogue")
     s.set_defaults(fn=cmd_albums)
+
+    s = sub.add_parser("people", help="named people from iCloud's People album, with their face crop counts")
+    s.set_defaults(fn=cmd_people)
 
     s = sub.add_parser("search", help="find assets in the catalogue (no network)",
                        description="Newest capture first. Results are paged: pass the printed cursor back "

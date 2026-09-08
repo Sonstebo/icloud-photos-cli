@@ -1,119 +1,117 @@
-"""Bring the catalogue up to date with the library.
+"""Bring the catalogue up to date with the library, from iCloud's change feed.
 
-First run: list everything (newest first) and record it. Later
-runs: ask iCloud's change feed what happened since the stored cursor and
-refetch only those records. `--full` forces a full listing, which is also
-the recovery path if the cursor ever stops working. Progress is written to
-the catalogue as it goes, so `photos status` can show it and a killed run
-loses nothing that was already committed.
+The photo zone in CloudKit hands out every record it holds, in modification
+order, in pages that each come with a sync token. The first sync walks the
+whole zone from the beginning; later syncs ask for what changed after the
+stored token; an interrupted sync resumes from the token of the last page
+it committed. One walk gives everything: assets and their masters, album
+membership (CPLContainerRelation), people (CPLPerson), face crops
+(CPLFaceCrop), and tombstones for whatever was deleted.
 """
 from __future__ import annotations
 
+import base64
 import json
+from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .adapter import Adapter, AssetInfo, Change
+from .adapter import Adapter, RawRecord
 from .catalog import Catalog, now
 
 Progress = Callable[[dict[str, Any]], None]
+KEPT_TYPES = {"CPLAsset", "CPLMaster", "CPLContainerRelation", "CPLPerson", "CPLFaceCrop"}
 
 
 def _noop(_: dict[str, Any]) -> None:
     pass
 
 
-def sync(catalog: Catalog, adapter: Adapter, *, full: bool = False, limit: int | None = None,
-         albums: bool = False, progress: Progress = _noop) -> dict[str, Any]:
-    started = now()
-    stored_cursor = catalog.get_meta("cursor")
+def _text(rec: RawRecord, key: str) -> str | None:
+    """Apple's *Enc fields are base64 text, not encryption."""
+    v = rec.value(key)
+    if not isinstance(v, str):
+        return None
+    try:
+        return base64.b64decode(v).decode("utf-8")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.astimezone(timezone.utc).isoformat() if dt else None
+
+
+def sync(catalog: Catalog, adapter: Adapter, *, full: bool = False, progress: Progress = _noop) -> dict[str, Any]:
+    token = None if full else catalog.get_meta("cursor")
     result: dict[str, Any] = {
-        "started": started, "mode": None, "listed": 0, "new": 0, "changed": 0,
-        "same": 0, "missing": 0, "albums": 0, "cursor_before": stored_cursor,
+        "started": now(), "mode": "full" if token is None else "changes", "pages": 0, "records": 0,
+        "new": 0, "changed": 0, "same": 0, "missing": 0, "relations": 0, "people": 0, "face_crops": 0,
+        "tombstones": 0, "resumed": bool(token and catalog.get_meta("sync_progress")),
     }
-    cursor_now = adapter.sync_cursor()
-    if not full and stored_cursor and stored_cursor == cursor_now:
-        result["mode"] = "unchanged"
-    elif not full and stored_cursor:
-        result["mode"] = "changes"
-        _apply_changes(catalog, adapter, stored_cursor, result, progress)
-    else:
-        result["mode"] = "full"
-        _full_listing(catalog, adapter, cursor_now, result, limit, progress)
-    if albums:
-        result["albums"] = _sync_albums(catalog, adapter, progress)
+    for page, next_token in adapter.iter_zone(token):
+        catalog.db.execute("BEGIN")
+        for rec in page:
+            _apply(catalog, adapter, rec, result)
+        result["pages"] += 1
+        result["records"] += len(page)
+        catalog.set_meta("cursor", next_token)
+        catalog.set_meta("sync_progress", json.dumps(result))
+        catalog.db.execute("COMMIT")
+        progress(result)
+    albums = adapter.albums()
+    catalog.replace_albums((a.id, a.name, a.fullname) for a in albums)
+    result["albums"] = len(albums)
     result["finished"] = now()
-    result["cursor_after"] = catalog.get_meta("cursor")
     catalog.set_meta("last_sync", json.dumps(result))
     catalog.set_meta("sync_progress", None)
     return result
 
 
-def _record(catalog: Catalog, info: AssetInfo, result: dict[str, Any]) -> None:
-    status = catalog.upsert_asset(info)
-    result[status] += 1
-    result["listed"] += 1
-
-
-def _full_listing(catalog: Catalog, adapter: Adapter, cursor_now: str | None,
-                  result: dict[str, Any], limit: int | None, progress: Progress) -> None:
-    seen: set[str] = set()
-    for info in adapter.iter_assets():
-        _record(catalog, info, result)
-        seen.add(info.id)
-        if result["listed"] % 100 == 0:
-            catalog.set_meta("sync_progress", json.dumps(result | {"phase": "listing"}))
-            progress(result)
-        if limit and result["listed"] >= limit:
-            break
-    if not limit:
-        # a complete listing means anything not seen this run has left the library
-        gone = catalog.asset_ids() - seen
-        stamp = now()
-        result["missing"] = sum(catalog.mark_missing(asset_id, stamp) for asset_id in gone)
-        # the cursor is only trustworthy after a complete listing
-        catalog.set_meta("cursor", cursor_now)
-
-
-def _apply_changes(catalog: Catalog, adapter: Adapter, since: str, result: dict[str, Any],
-                   progress: Progress) -> None:
-    changes, new_cursor = adapter.changes_since(since)
-    result["events"] = len(changes)
-    touched: dict[str, bool] = {}   # asset id -> deleted?
-    for ch in changes:
-        asset_id = _asset_id_for(catalog, ch)
-        if asset_id is None:
-            continue
-        touched[asset_id] = touched.get(asset_id, False) or ch.deleted
-    for n, (asset_id, deleted) in enumerate(touched.items(), 1):
-        info = None if deleted else adapter.get_asset(asset_id)
-        if info is None:
-            if catalog.mark_missing(asset_id):
+def _apply(catalog: Catalog, adapter: Adapter, rec: RawRecord, result: dict[str, Any]) -> None:
+    if rec.deleted:
+        result["tombstones"] += 1
+        known = catalog.get_record(rec.name)
+        rtype = rec.type or (known["type"] if known else None)
+        if rtype is None:
+            # never seen this record; only an asset id could matter, and it costs nothing to try
+            if catalog.mark_missing(rec.name):
                 result["missing"] += 1
-        else:
-            _record(catalog, info, result)
-        if n % 50 == 0:
-            catalog.set_meta("sync_progress", json.dumps(result | {"phase": "changes", "of": len(touched)}))
-            progress(result)
-    catalog.set_meta("cursor", new_cursor or since)
+            return
+        catalog.put_record(rec.name, rtype, True, _iso(rec.modified), None, None)
+        if rtype == "CPLAsset" and catalog.mark_missing(rec.name):
+            result["missing"] += 1
+        elif rtype == "CPLContainerRelation" and known and known["json"]:
+            r = RawRecord(rec.name, rtype, True, None, known["json"])
+            catalog.set_relation(r.value("containerId"), r.value("itemId"), True)
+        elif rtype == "CPLPerson":
+            catalog.mark_deleted("people", rec.name)
+        elif rtype == "CPLFaceCrop":
+            catalog.mark_deleted("face_crops", rec.name)
+        return
+    if rec.type not in KEPT_TYPES:
+        return
+    catalog.put_record(rec.name, rec.type, False, _iso(rec.modified), rec.master_ref, rec.fields)
+    if rec.type == "CPLAsset":
+        master = catalog.get_record(rec.master_ref) if rec.master_ref else None
+        if master and master["json"] and not master["deleted"]:
+            _asset(catalog, adapter, rec, RawRecord(master["name"], "CPLMaster", False, None, master["json"]), result)
+    elif rec.type == "CPLMaster":
+        for asset in catalog.assets_of_master(rec.name):
+            _asset(catalog, adapter, RawRecord(asset["name"], "CPLAsset", False, None, asset["json"]), rec, result)
+    elif rec.type == "CPLContainerRelation":
+        catalog.set_relation(rec.value("containerId"), rec.value("itemId"), False)
+        result["relations"] += 1
+    elif rec.type == "CPLPerson":
+        catalog.put_person(rec.name, _text(rec, "personFullNameEnc"), _text(rec, "displayName"),
+                           bool(rec.value("verifiedType")), rec.value("personType"), _iso(rec.modified))
+        result["people"] += 1
+    elif rec.type == "CPLFaceCrop":
+        ref = rec.value("personRef") or {}
+        catalog.put_face_crop(rec.name, ref.get("recordName") if isinstance(ref, dict) else None,
+                              rec.value("type"), rec.value("resFaceCropFileSize"), _iso(rec.modified))
+        result["face_crops"] += 1
 
 
-def _asset_id_for(catalog: Catalog, ch: Change) -> str | None:
-    if ch.record_type == "CPLMaster":
-        return catalog.asset_id_for_master(ch.record_name)
-    if ch.record_type in (None, "CPLAsset"):
-        # tombstones carry no type: it is an asset if we know it, a master if
-        # we know it that way, otherwise something we never tracked (an album)
-        if ch.record_type is None and catalog.get_asset(ch.record_name) is None:
-            return catalog.asset_id_for_master(ch.record_name)
-        return ch.record_name
-    return None
-
-
-def _sync_albums(catalog: Catalog, adapter: Adapter, progress: Progress) -> int:
-    albums = adapter.albums()
-    catalog.replace_albums((a.id, a.name, a.fullname) for a in albums)
-    for n, album in enumerate(albums, 1):
-        catalog.replace_album_members(album.id, adapter.iter_album_asset_ids(album.id))
-        catalog.set_meta("sync_progress", json.dumps({"phase": "albums", "done": n, "of": len(albums)}))
-        progress({"phase": "albums", "done": n, "of": len(albums)})
-    return len(albums)
+def _asset(catalog: Catalog, adapter: Adapter, asset: RawRecord, master: RawRecord, result: dict[str, Any]) -> None:
+    info = adapter.asset_from_records(asset, master)
+    result[catalog.upsert_asset(info)] += 1
