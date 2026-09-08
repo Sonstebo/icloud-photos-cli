@@ -133,9 +133,10 @@ class FakeCloud:
         for asset_id, master_id in items:
             yield asset_id, self.download(asset_id, version, master_id)
 
-    def download_face_crop(self, crop_id):
-        self.downloads.append((crop_id, "facecrop"))
-        return b"CROP:" + crop_id.encode()
+    def download_face_crops(self, crop_ids, threads=4):
+        for crop_id in crop_ids:
+            self.downloads.append((crop_id, "facecrop"))
+            yield crop_id, b"CROP:" + crop_id.encode()
 
     def albums(self):
         return list(self.album_list)

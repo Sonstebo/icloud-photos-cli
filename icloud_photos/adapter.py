@@ -99,7 +99,7 @@ class Adapter(Protocol):
     def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
         """(asset_id, master_id) pairs -> (asset_id, bytes); one lookup per batch, downloads in parallel."""
         ...
-    def download_face_crop(self, crop_id: str) -> bytes | None: ...
+    def download_face_crops(self, crop_ids: list[str], threads: int = 4) -> Iterator[tuple[str, bytes | None]]: ...
     def albums(self) -> list[AlbumInfo]: ...
 
 
@@ -256,17 +256,31 @@ class ICloudAdapter:
                     except Exception:  # noqa: BLE001 - one bad download must not end the run
                         yield asset_id, None
 
-    def download_face_crop(self, crop_id: str) -> bytes | None:
+    def download_face_crops(self, crop_ids: list[str], threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
+        from concurrent.futures import ThreadPoolExecutor
+
         from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
 
         library = self._library()
-        recs = library._client.lookup(record_names=[crop_id], zone_id=CKZoneIDReq(**library.zone_id)).records
-        rec = next((r for r in recs if isinstance(r, CKRecord)), None)
-        if rec is None:
-            return None
-        res = (rec.model_dump(mode="json").get("fields") or {}).get("resFaceCropRes", {}).get("value") or {}
-        url = res.get("downloadURL")
-        return library._client.download_asset_bytes(url) if url else None
+        zone = CKZoneIDReq(**library.zone_id)
+        client = library._client
+
+        def url_of(rec: Any) -> str | None:
+            res = (rec.model_dump(mode="json").get("fields") or {}).get("resFaceCropRes", {}).get("value") or {}
+            return res.get("downloadURL")
+
+        for i in range(0, len(crop_ids), 50):
+            batch = crop_ids[i:i + 50]
+            found = {r.recordName: r for r in client.lookup(record_names=batch, zone_id=zone).records if isinstance(r, CKRecord)}
+            urls = {cid: url_of(found[cid]) for cid in batch if cid in found}
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                futures = {cid: pool.submit(client.download_asset_bytes, url) for cid, url in urls.items() if url}
+                for cid in batch:
+                    fut = futures.get(cid)
+                    try:
+                        yield cid, (fut.result() if fut is not None else None)
+                    except Exception:  # noqa: BLE001
+                        yield cid, None
 
     def albums(self) -> list[AlbumInfo]:
         return [AlbumInfo(a.id, a.name, a.fullname) for a in self.photos().albums]

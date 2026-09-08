@@ -47,9 +47,10 @@ def seed_people(catalog: Catalog, adapter: Adapter, models: Models, *, named_onl
                 progress: Progress = _noop) -> dict[str, Any]:
     """Embed iCloud's face crops for named people into person_seeds."""
     crops = catalog.unseeded_crops(named_only=named_only)
+    person_of = {c["id"]: c["person_id"] for c in crops}
     result = {"crops": len(crops), "seeded": 0, "no_face": 0, "failed": 0}
-    for n, crop in enumerate(crops, 1):
-        data = adapter.download_face_crop(crop["id"])
+    for n, (crop_id, data) in enumerate(adapter.download_face_crops(list(person_of)), 1):
+        crop = {"id": crop_id, "person_id": person_of[crop_id]}
         img = decode_image(data) if data else None
         if img is None:
             result["failed"] += 1
@@ -73,8 +74,10 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
     result: dict[str, Any] = {"started": now(), "todo": len(todo), "done": 0, "faces": 0, "named": 0,
                               "fetched": 0, "failed": 0, "source": source}
     seeds = SeedIndex(catalog.seeds())
-    for i in range(0, len(todo), batch):
-        chunk = todo[i:i + batch]
+    chunks = [todo[i:i + batch] for i in range(0, len(todo), batch)]
+
+    def prepare(chunk: list[dict[str, Any]]) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+        """Main thread: what the cache already has, and what must be downloaded."""
         images: dict[str, np.ndarray] = {}
         need = []
         for a in chunk:
@@ -85,18 +88,31 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
                     images[a["id"]] = img
                     continue
             need.append(a)
-        for asset_id, data in adapter.download_many([(a["id"], a["master_id"]) for a in need], source):
-            if data is None:
-                continue
-            result["fetched"] += 1
+        return images, need
+
+    def download(need: list[dict[str, Any]]) -> list[tuple[str, bytes]]:
+        """Worker thread: network only, no catalogue access."""
+        return [(asset_id, data) for asset_id, data in
+                adapter.download_many([(a["id"], a["master_id"]) for a in need], source) if data is not None]
+
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=1)     # the next chunk downloads while this one is analysed
+    staged = [prepare(c) for c in chunks[:1]]
+    pending = pool.submit(download, staged[0][1]) if chunks else None
+    for i, chunk in enumerate(chunks):
+        images, _ = staged[i]
+        downloaded = pending.result()
+        if i + 1 < len(chunks):
+            staged.append(prepare(chunks[i + 1]))
+            pending = pool.submit(download, staged[i + 1][1])
+        for asset_id, data in downloaded:
             img = decode_image(data)
             if img is None:
                 continue
             images[asset_id] = img
-            a = next(x for x in need if x["id"] == asset_id)
-            ext = ".jpg"
+            result["fetched"] += 1
             try:
-                cache.put(asset_id, source, data, ext)
+                cache.put(asset_id, source, data, ".jpg")
             except BudgetExceeded:
                 pass   # indexing does not need the file kept
         catalog.db.execute("BEGIN")
@@ -118,6 +134,7 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
         catalog.set_meta("index_progress", json.dumps(result))
         catalog.db.execute("COMMIT")
         progress(result)
+    pool.shutdown(wait=True)
     result["finished"] = now()
     catalog.set_meta("last_index", json.dumps(result))
     catalog.set_meta("index_progress", None)
