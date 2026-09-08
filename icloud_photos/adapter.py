@@ -74,7 +74,7 @@ class Adapter(Protocol):
     def auth_status(self) -> dict[str, Any]: ...
     def sync_cursor(self) -> str | None: ...
     def iter_assets(self) -> Iterator[AssetInfo]:
-        """Every asset in the library, in iCloud's listing order (oldest first, as observed)."""
+        """Every asset in the library, newest first."""
         ...
     def get_asset(self, asset_id: str) -> AssetInfo | None: ...
     def changes_since(self, cursor: str) -> tuple[list[Change], str | None]: ...
@@ -154,8 +154,57 @@ class ICloudAdapter:
         return self.photos().sync_cursor()
 
     def iter_assets(self) -> Iterator[AssetInfo]:
-        for photo in self.photos().all:
+        """Every asset in the library, newest first."""
+        for photo in self._iter_album_photos(self.photos().all):
             yield self._info(photo)
+
+    def _iter_album_photos(self, album: Any, page: int = 100) -> Iterator[Any]:
+        """Walk an album's index rank by rank; complete where pyicloud's pager is not.
+
+        pyicloud asks for 2*page records and pairs the CPLAsset records it gets
+        with the CPLMaster records in the same reply. With a real library the
+        reply's record budget runs out before every asset has its master, so a
+        page of 100 ranks yields ~70 photos and, when one yields fewer than 50,
+        pyicloud takes that as the end of the library (it stopped in July 2024
+        here, 13,000 assets short). Descending album walks can also loop at
+        rank 0. This pager looks up the missing masters by name instead, and
+        advances by the number of asset ranks actually returned.
+        """
+        from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
+        from pyicloud.services.photos_cloudkit.mappers import record_field_value
+        from pyicloud.services.photos_cloudkit.queries import list_query
+
+        library = album._library
+        client = album._client
+        zone = CKZoneIDReq(**library.zone_id)
+        offset, seen = 0, set()
+        while True:
+            query = list_query(list_type=album._list_type, direction=album._direction, offset=offset,
+                               extra_filters=album._query_filters(offset=offset, direction=album._direction))
+            records = client.query(query=query, zone_id=zone, results_limit=page * 2).records
+            typed = [r for r in records if isinstance(r, CKRecord)]
+            assets = [r for r in typed if r.recordType == "CPLAsset"]
+            masters = {r.recordName: r for r in typed if r.recordType == "CPLMaster"}
+            if not assets:
+                return
+            wanted = {}
+            for asset in assets:
+                ref = record_field_value(asset, "masterRef")
+                name = getattr(ref, "recordName", None) or (ref.get("recordName") if isinstance(ref, dict) else None)
+                if name:
+                    wanted[asset.recordName] = name
+            missing = sorted({m for m in wanted.values() if m not in masters})
+            for i in range(0, len(missing), 100):
+                for r in client.lookup(record_names=missing[i:i + 100], zone_id=zone).records:
+                    if isinstance(r, CKRecord):
+                        masters[r.recordName] = r
+            for asset in assets:
+                master = masters.get(wanted.get(asset.recordName, ""))
+                if master is None or asset.recordName in seen:
+                    continue
+                seen.add(asset.recordName)
+                yield library.asset_type(self.photos(), master, asset, library=library)
+            offset += len(assets)
 
     def get_asset(self, asset_id: str) -> AssetInfo | None:
         photo = self.photos().all.get(asset_id)
@@ -182,7 +231,7 @@ class ICloudAdapter:
         album = self.photos().albums.get(album_id)
         if album is None:
             return
-        for photo in album.photos:
+        for photo in self._iter_album_photos(album):
             yield photo.id
 
     @staticmethod

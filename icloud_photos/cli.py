@@ -449,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    "progress is committed as it goes.")
     s.add_argument("--full", action="store_true", help="list everything again instead of using the change feed")
     s.add_argument("--albums", action="store_true", help="also refresh album names and membership (slower)")
-    s.add_argument("--limit", type=int, metavar="N", help="stop after N assets (a first look at the oldest ones; leaves the cursor unset)")
+    s.add_argument("--limit", type=int, metavar="N", help="stop after N assets (a first look at the newest; leaves the cursor unset)")
     s.add_argument("--background", action="store_true", help="run detached; follow with `photos status`")
     s.set_defaults(fn=cmd_sync)
 
