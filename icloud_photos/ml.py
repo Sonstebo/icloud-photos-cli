@@ -219,7 +219,10 @@ class OnnxModels:
         with contextlib.redirect_stdout(sys.stderr), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             # the pack downloads itself on first use (~280 MB from InsightFace's GitHub release)
-            app = FaceAnalysis(name=FACE_MODEL, root=str(root), providers=["CPUExecutionProvider"])
+            # detection and recognition are what the index uses; genderage is cheap and stored.
+            # The two landmark heads (2d106det, 1k3d68) fed nothing and cost 40% of the pass.
+            app = FaceAnalysis(name=FACE_MODEL, root=str(root), providers=["CPUExecutionProvider"],
+                               allowed_modules=["detection", "recognition", "genderage"])
             app.prepare(ctx_id=-1, det_size=(640, 640))
         if self.compute[0] == "gpu":
             # insightface builds plain CPU sessions and keeps each under model.session,
