@@ -180,7 +180,7 @@ class ICloudAdapter:
                 if isinstance(rec, CKRecord):
                     page.append(RawRecord(rec.recordName, rec.recordType, bool(rec.deleted),
                                           rec.modified.timestamp if rec.modified else None,
-                                          rec.model_dump(mode="json", exclude_none=True)))
+                                          rec.model_dump(mode="json")))
                 else:
                     page.append(RawRecord(rec.recordName, None, True, None))
             yield page, zone.syncToken
