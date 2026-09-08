@@ -121,11 +121,13 @@ def resolve_compute(mode: str) -> tuple[str, str]:
 
 
 class OnnxModels:
-    def __init__(self, models_dir: Path, threads: int | None = None, compute: str = "auto") -> None:
+    def __init__(self, models_dir: Path, threads: int | None = None, compute: str = "auto",
+                 record: Path | None = None) -> None:
         self.dir = Path(models_dir)
         self.clip_name, self.face_name = CLIP_MODEL, FACE_MODEL
         self.threads = threads
         self.compute_mode = compute
+        self.record = record            # where the resolution is written for `status` to read
         self._compute: tuple[str, str] | None = None
         self._visual = self._textual = self._tokenizer = self._faces = None
         self._cfg: dict[str, Any] | None = None
@@ -143,6 +145,10 @@ class OnnxModels:
         """Resolved once per process: ("gpu" | "cpu", detail)."""
         if self._compute is None:
             self._compute = resolve_compute(self.compute_mode)
+            if self.record is not None:
+                from datetime import datetime, timezone
+                self.record.write_text(json.dumps({"mode": self.compute_mode, "resolved": self._compute[0],
+                                                   "detail": self._compute[1], "when": datetime.now(timezone.utc).isoformat()}))
         return self._compute
 
     def _options(self) -> Any:

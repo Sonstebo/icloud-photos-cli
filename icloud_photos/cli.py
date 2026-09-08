@@ -26,7 +26,7 @@ from .catalog import Catalog
 from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
 from . import index as indexing
-from .ml import COMPUTE_MODES, ComputeUnavailable, ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob, resolve_compute
+from .ml import COMPUTE_MODES, ComputeUnavailable, ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob
 
 EXT_BY_TYPE = {
     "public.jpeg": ".jpg", "public.heic": ".heic", "public.heif": ".heif", "public.png": ".png",
@@ -57,7 +57,8 @@ class App:
         # failed on Vulkan under memory pressure (2026-09-08).
         self.gpu_allowed = False
         self._models_factory = models_factory or (lambda app: OnnxModels(
-            app.paths.models_dir, compute=str(app.config.values.get("compute", "auto")) if app.gpu_allowed else "cpu"))
+            app.paths.models_dir, compute=str(app.config.values.get("compute", "auto")) if app.gpu_allowed else "cpu",
+            record=app.paths.index_lock.with_name("compute.json") if app.gpu_allowed else None))
         self.paths = Paths.discover().ensure()
         self.config = Config.load(self.paths.config_file)
         self._catalog: Catalog | None = None
@@ -217,7 +218,7 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
         lines.append(f"index:    {ix['indexed']} of {ix['images']} images; {ix['faces']} faces, {ix['faces_named']} named; "
                      f"{ix['seeds']} seeds for {ix['seeded_people']} people" + (f"; running {ix['progress']}" if ix["running"] else ""))
         cp = p["compute"]
-        lines.append(f"compute:  {cp['resolved']} ({cp['detail']}; configured {cp['mode']})")
+        lines.append(f"compute:  {cp['resolved'] or 'unknown'} ({cp['detail']}; configured {cp['mode']})")
         return "\n".join(lines)
 
     app.emit(payload, text)
@@ -225,13 +226,18 @@ def cmd_status(app: App, args: argparse.Namespace) -> int:
 
 
 def _compute_status(app: App) -> dict[str, Any]:
-    """Where the models would run right now, resolved the same way the index does."""
+    """The configured mode and what the last index run resolved it to. Status
+    does not probe the GPU itself: a second process on it while the worker
+    runs has pushed this 8 GB machine into the OOM killer."""
     mode = str(app.config.values.get("compute", "auto"))
-    try:
-        resolved, detail = resolve_compute(mode)
-    except (ComputeUnavailable, ValueError) as err:
-        resolved, detail = "unavailable", str(err)
-    return {"mode": mode, "resolved": resolved, "detail": detail}
+    rec = app.paths.index_lock.with_name("compute.json")
+    if rec.exists():
+        try:
+            last = json.loads(rec.read_text())
+            return {"mode": mode, "resolved": last.get("resolved"), "detail": last.get("detail"), "when": last.get("when")}
+        except (OSError, ValueError):
+            pass
+    return {"mode": mode, "resolved": None, "detail": "not resolved yet; the next `index` run records it", "when": None}
 
 
 def _sync_pid(app: App) -> int | None:
