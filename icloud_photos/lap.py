@@ -160,6 +160,14 @@ class LapLibrary:
             "INSERT OR REPLACE INTO athumbs (file_id, error_code, thumb_data, thumb_key, thumb_mtime, thumb_size, updated_at) VALUES (?,0,?,NULL,?,?,?)",
             (file_id, data, source_mtime if source_mtime is not None else now, self.thumb_size, now))
 
+    def put_thumb_error(self, file_id: int) -> None:
+        """Mark a file as having no thumbnail source; lap keeps error rows for missing files."""
+        if self.db.execute("SELECT 1 FROM athumbs WHERE file_id=?", (file_id,)).fetchone():
+            return
+        now = int(time.time())
+        self.db.execute("INSERT INTO athumbs (file_id, error_code, thumb_data, thumb_key, thumb_mtime, thumb_size, updated_at) VALUES (?,1,NULL,NULL,?,?,?)",
+                        (file_id, now, self.thumb_size, now))
+
     # --- people and collections ------------------------------------------------
     def person_id(self, name: str) -> int:
         row = self.db.execute("SELECT id FROM persons WHERE name=?", (name,)).fetchone()
@@ -285,6 +293,10 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             if thumb is not None:
                 lap.put_thumb(fid, thumb.read_bytes(), int(target.stat().st_mtime) if target is not None else None)
                 result["thumbs"] += 1
+            elif target is None:
+                # nothing on disk to make one from: an error row keeps lap from trying
+                # (it would spawn ffmpeg for every movie entry on every start)
+                lap.put_thumb_error(fid)
             if faces:
                 # our boxes are in the pixels of the rendition the face pass saw; lap wants the linked file's
                 sw, sh = rendition_dims(a, faces[0].get("source") or "thumb")
