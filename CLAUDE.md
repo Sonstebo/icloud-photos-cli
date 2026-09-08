@@ -23,7 +23,7 @@ pyicloud findings, for an upstream report: (1) `PhotoAlbum.photos` stops when a 
 
 Not started: pass 2 on medium previews, shared library, video sampling, ANE inference, a bug report to pyicloud.
 
-Published to GitHub (see above). The hourly sync timer is enabled.
+Published to GitHub (see above). The hourly sync timer is enabled. **Release 0.2.0 (2026-09-08 evening):** MIT licence, full package metadata, CHANGELOG, tag v0.2.0 and a GitHub release; a clean `git clone` + `pip install .` on this machine passes the tests (one skipped where workers are forced plain); unexpected exceptions are one line with code `internal-error` (ICLOUD_PHOTOS_DEBUG=1 re-raises); the systemd unit runs `~/.local/bin/photos`, which the README's install creates; README has a JSON-output reference. The GitHub Actions workflow (Python 3.11-3.13) is committed on local branch `ci-workflow` and cannot be pushed until the user grants the gh token the `workflow` scope (`gh auth refresh -h github.com -s workflow`).
 
 ## Decisions (2026-09-08)
 
