@@ -12,7 +12,9 @@ Implementation started 2026-09-08 on the user's instruction. The user logged in 
 
 pyicloud findings, for an upstream report: (1) `PhotoAlbum.photos` stops when a page pairs fewer than half its assets with masters (the reply's record budget runs out), which ended a listing at July 2024 here; (2) descending album walks can loop at rank 0; (3) `PhotoAlbum.get(id)` falls back to iterating the whole library when the index lookup misses; (4) `PhotoAsset.favorite()` is a setter. The adapter avoids all four by using the change feed and `records/lookup`.
 
-Not started: semantic search, faces, objects, shared library, video sampling. Reuse rule applies (see Decisions): evaluate Immich's machine-learning service, PhotoPrism, rclip and the underlying models (CLIP via open_clip, InsightFace) before writing anything; the person records and face crops can seed a recogniser with the user's identities. RAM is 8 GB; that bounds model choice.
+- **Index** (`icloud_photos/index.py`, `ml.py`, chosen 2026-09-08 after benchmarking on this machine): Immich's ONNX export of CLIP ViT-B-32 (huggingface.co/immich-app/ViT-B-32__openai, 600 MB under `~/.local/share/icloud-photos/models/`) under onnxruntime, and InsightFace buffalo_l, both CPU. Measured: 85 ms per CLIP embedding, ~0.4 s per face pass, ~0.58 s per thumbnail all in, 2.1 GB RSS. Docker is unusable from the user's account, which ruled out Immich's container; torch was tried and removed (5 GB, unnecessary). Seeds: 501 embeddings from the 543 iCloud face crops of the 95 named people (42 crops too small). First 40 images: 34 faces, one named at cosine 0.77 (a clear portrait), the rest below 0.5; a 1980s scan scored 0.42 against a person seeded from recent faces, which is the expected age gap and what `faces unassigned` + `faces assign` are for. Pass 1 (thumbnails) over all 30,165 images started 2026-09-08 in the background, roughly 5 hours.
+
+Not started: pass 2 on medium previews, shared library, video sampling, GPU/ANE inference, a bug report to pyicloud.
 
 Publishing to GitHub still requires an instruction. The systemd user timer in `systemd/` is written but not enabled.
 

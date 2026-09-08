@@ -133,18 +133,30 @@ class OnnxModels:
     def _load_faces(self) -> None:
         if self._faces is not None:
             return
+        import contextlib
+        import sys
+        import warnings
+
         from insightface.app import FaceAnalysis
 
         root = self.dir / "insightface"
-        # the pack downloads itself on first use (~280 MB from InsightFace's GitHub release)
-        app = FaceAnalysis(name=FACE_MODEL, root=str(root), providers=["CPUExecutionProvider"])
-        app.prepare(ctx_id=-1, det_size=(640, 640))
+        # insightface prints its model inventory to stdout, which would corrupt --json output
+        with contextlib.redirect_stdout(sys.stderr), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # the pack downloads itself on first use (~280 MB from InsightFace's GitHub release)
+            app = FaceAnalysis(name=FACE_MODEL, root=str(root), providers=["CPUExecutionProvider"])
+            app.prepare(ctx_id=-1, det_size=(640, 640))
         self._faces = app
 
     def faces(self, bgr: np.ndarray) -> list[dict[str, Any]]:
+        import warnings
+
         self._load_faces()
         out = []
-        for f in self._faces.get(bgr):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            found = self._faces.get(bgr)
+        for f in found:
             emb = f.normed_embedding
             out.append({
                 "box": [int(round(x)) for x in f.bbox.tolist()],   # x1, y1, x2, y2 in the analysed image
