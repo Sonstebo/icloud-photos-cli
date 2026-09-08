@@ -3,6 +3,8 @@
 `Adapter` is what the rest of the package talks to. `ICloudAdapter` is the
 real one, a thin layer over pyicloud; tests use a fake with the same shape.
 Nothing here writes to iCloud: listing, the change feed and downloads only.
+Take care with pyicloud's PhotoAsset: favorite(), unfavorite(), set_favorite()
+and delete() are writes, not getters. Read fields with record_field_value.
 """
 from __future__ import annotations
 
@@ -72,7 +74,7 @@ class Adapter(Protocol):
     def auth_status(self) -> dict[str, Any]: ...
     def sync_cursor(self) -> str | None: ...
     def iter_assets(self) -> Iterator[AssetInfo]:
-        """Every asset in the library, newest capture date first."""
+        """Every asset in the library, in iCloud's listing order (oldest first, as observed)."""
         ...
     def get_asset(self, asset_id: str) -> AssetInfo | None: ...
     def changes_since(self, cursor: str) -> tuple[list[Change], str | None]: ...
@@ -211,7 +213,10 @@ class ICloudAdapter:
             width=width,
             height=height,
             bytes=photo.size,
-            favorite=bool(photo.favorite),
+            # read the field: PhotoAsset.favorite() is a *setter* in pyicloud 2.7
+            # (it marks the asset as a favourite in iCloud), as are unfavorite(),
+            # set_favorite(), delete() and PhotoAlbum.add_photo(). Never call them.
+            favorite=bool(record_field_value(asset_record, "isFavorite") or 0),
             caption=decode_encrypted_text(asset_record, "captionEnc") or None,
             latitude=location.get("latitude"),
             longitude=location.get("longitude"),

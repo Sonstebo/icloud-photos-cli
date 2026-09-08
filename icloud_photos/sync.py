@@ -1,6 +1,6 @@
 """Bring the catalogue up to date with the library.
 
-First run: list everything (newest capture first) and record it. Later
+First run: list everything (iCloud lists oldest first) and record it. Later
 runs: ask iCloud's change feed what happened since the stored cursor and
 refetch only those records. `--full` forces a full listing, which is also
 the recovery path if the cursor ever stops working. Progress is written to

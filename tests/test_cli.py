@@ -90,6 +90,38 @@ class FakeCloud:
         yield from self.album_members.get(album_id, [])
 
 
+def stub_record(**fields):
+    """A raw-dict CloudKit record, the legacy shape pyicloud's mappers accept."""
+    return {"recordName": "R", "fields": {k: {"value": v} for k, v in fields.items()}}
+
+
+class StubPhoto:
+    """A pyicloud PhotoAsset look-alike whose writes explode."""
+
+    def __init__(self):
+        self.asset_record = stub_record(isFavorite=1, isHidden=0, assetDate=T0)
+        self.master_record = stub_record()
+        self.id, self.master_id, self.filename, self.item_type = "P1", "M1", "IMG_1.JPG", "image"
+        self.is_live_photo, self.dimensions, self.size = False, (10, 10), 5
+        self.asset_date, self.added_date, self.versions = T0, T0, {}
+
+    def favorite(self):
+        raise AssertionError("favorite() writes to iCloud")
+
+    unfavorite = set_favorite = delete = favorite
+
+
+class AdapterTest(unittest.TestCase):
+    def test_reading_an_asset_never_calls_a_writing_method(self):
+        try:
+            from icloud_photos.adapter import ICloudAdapter
+            info = ICloudAdapter._info(StubPhoto())
+        except ModuleNotFoundError:
+            self.skipTest("pyicloud not installed")
+        self.assertTrue(info.favorite)
+        self.assertFalse(info.hidden)
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

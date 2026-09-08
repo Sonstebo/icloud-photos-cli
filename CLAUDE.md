@@ -18,6 +18,8 @@ Not started: semantic search, faces, objects, shared library, video sampling. Re
 
 Publishing to GitHub still requires an instruction.
 
+**Incident, 2026-09-08 ~07:00 UTC:** a probe script called `PhotoAsset.favorite()` on asset `87F67146-8DD4-4FEE-86FB-FA22B8DF98BC` (IMG_0556.JPG, taken 2002-09-18) to read the flag; in pyicloud 2.7 that method is a setter and marked the photo as a favourite in iCloud (record modified 06:59:29 UTC). The revert (`unfavorite()`) was blocked by the permission system and is left to the user. Lesson, now in `adapter.py` and a test: read CloudKit fields with `record_field_value`; `favorite()`, `unfavorite()`, `set_favorite()`, `delete()`, `add_photo()`, `upload()` are writes. Never call methods on a live `PhotoAsset` to discover what they do.
+
 ## Decisions (2026-09-08)
 
 - **The overriding goal is a perfect fit for AI assistants working through a CLI.** Every other quality (GUI, speed, breadth of features) is secondary. Concretely:
