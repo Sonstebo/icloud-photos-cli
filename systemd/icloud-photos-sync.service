@@ -4,6 +4,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/Work/icloud-photo-workspace/.venv/bin/photos --json sync
+ExecStart=%h/.local/bin/photos --json sync
 Nice=10
 IOSchedulingClass=idle

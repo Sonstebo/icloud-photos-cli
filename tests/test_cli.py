@@ -284,7 +284,8 @@ class CliTest(unittest.TestCase):
         self.cloud.iter_zone = flaky
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            with self.assertRaises(Boom):
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"ICLOUD_PHOTOS_DEBUG": "1"}), self.assertRaises(Boom):   # debug mode re-raises
                 cli.main(["--json", "sync"], adapter_factory=lambda app: self.cloud)
         s, _ = self.j("status", "--offline")
         self.assertIsNotNone(s["sync_progress"])
@@ -708,3 +709,21 @@ class LapExportTests(unittest.TestCase):
             con.close()
         finally:
             t.tearDown()
+
+
+class InternalErrorTests(unittest.TestCase):
+    def test_unexpected_exception_is_one_line_with_a_code(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"ICLOUD_PHOTOS_HOME": tmp}):
+            os.environ.pop("ICLOUD_PHOTOS_DEBUG", None)
+            def boom(app):
+                raise RuntimeError("models exploded")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = cli.main(["--json", "search", "--semantic", "x"], models_factory=boom)
+            self.assertEqual(rc, 1)
+            payload = json.loads(err.getvalue().strip().splitlines()[-1])
+            self.assertEqual(payload["error"], "internal-error")
+            self.assertIn("RuntimeError: models exploded", payload["message"])
+            self.assertNotIn("Traceback", err.getvalue())

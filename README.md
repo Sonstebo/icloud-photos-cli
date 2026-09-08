@@ -21,7 +21,7 @@ collections, and the CLI.
 
 CLIP and the face models run through onnxruntime. With
 [onnxruntime-ggml](https://github.com/thewh1teagle/onnxruntime-ggml) installed
-in the same environment they run on the GPU instead, through Vulkan or Metal,
+in the same venv (`pip install onnxruntime-ggml`) they run on the GPU instead, through Vulkan or Metal,
 at a fraction of the CPU's energy: on an Apple M1 under Asahi Linux the face
 pass draws about 12 W instead of 27 W for the same work, and is slightly
 faster. `config set compute auto|cpu|gpu` chooses; `auto` (the default) uses
@@ -30,6 +30,14 @@ CPU, and says why in `photos status` when it does not. Only `index` uses the GPU
 queries embed their text on the CPU so they never compete with a running
 index worker. Nothing else changes:
 embeddings from either path compare at cosine 1.0000.
+
+Until the provider's next release, the published Linux arm64 wheel crashes on
+Apple Silicon and the vision models need pull requests
+[#4](https://github.com/thewh1teagle/onnxruntime-ggml/pull/4) and
+[#6](https://github.com/thewh1teagle/onnxruntime-ggml/pull/6); build from
+[this fork](https://github.com/Sonstebo/onnxruntime-ggml) (branch
+`aarch64-conv2d`, `docs/BUILDING.md`) and `pip install -e python/`. Without a
+working provider everything runs on the CPU.
 
 ## Browsing with lap
 
@@ -45,13 +53,17 @@ fetched.
 ## Install
 
 ```sh
-cd ~/Work/icloud-photo-workspace
+git clone https://github.com/Sonstebo/icloud-photos-cli
+cd icloud-photos-cli
 python3 -m venv .venv
-.venv/bin/pip install -e .
-ln -s "$PWD/.venv/bin/photos" ~/.local/bin/photos   # optional
+.venv/bin/pip install .
+ln -s "$PWD/.venv/bin/photos" ~/.local/bin/photos
 ```
 
-Python 3.11 or newer. Nothing outside the venv.
+Python 3.11 or newer, Linux or macOS. The symlink puts `photos` on your PATH
+and is what the systemd timer below runs. Nothing is installed outside the
+venv; the catalogue, cache and state live under the XDG directories
+(`photos status` prints the paths). Tests: `python -m unittest discover -s tests`.
 
 ## First run
 
