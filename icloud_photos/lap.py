@@ -119,10 +119,20 @@ class LapLibrary:
         return int(cur.lastrowid)
 
     def set_fetch_command(self, album_id: int, command: str | None) -> None:
-        """lap's fetch-on-open command for the album, when this lap has the column (its migration 17)."""
+        """The album's fetch-on-open command, when the app has that column (its migration 17)."""
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(albums)")}
         if "fetch_command" in cols:
             self.db.execute("UPDATE albums SET fetch_command=? WHERE id=?", (command, album_id))
+
+    def set_managed(self, album_id: int) -> bool:
+        """Mark the album as maintained here (the app's migration 18). Without it the
+        app rescans the folder on start and deletes every row whose file is not on
+        disk, which is all of them until a preview is opened."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(albums)")}
+        if "managed" not in cols:
+            return False
+        self.db.execute("UPDATE albums SET managed=1 WHERE id=?", (album_id,))
+        return True
 
     def folder_id(self, album_id: int, path: Path, has_subfolders: bool) -> int:
         row = self.db.execute("SELECT id FROM afolders WHERE album_id=? AND path=?", (album_id, str(path))).fetchone()
@@ -262,6 +272,7 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                               "thumbs": 0, "embeddings": 0, "faces": 0, "people": 0, "collections": 0, "skipped": 0}
     album = lap.album_id()
     lap.set_fetch_command(album, fetch_command)
+    result["managed"] = lap.set_managed(album)
     root_folder = lap.folder_id(album, lap.root, True)
     folders: dict[str, int] = {}
     file_ids: dict[str, int] = {}

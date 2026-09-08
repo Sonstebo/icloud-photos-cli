@@ -340,6 +340,9 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
                                    progress=progress)
     finally:
         lib.close()
+    if not result.get("managed"):
+        print("warning: this build of the app does not support managed albums (its migration 18); it will "
+              "delete rows whose file is not cached. Update it before browsing.", file=sys.stderr)
     app.emit(result, lambda r: f"lap library {r['library']}: {r['files']} files ({r['linked']} with a cached file), "
                                f"{r['thumbs']} thumbnails, {r['embeddings']} embeddings, {r['faces']} faces of {r['people']} people, "
                                f"{r['collections']} collections; restart lap to see them")
