@@ -117,6 +117,30 @@ terminal, 3 not logged in, 4 cache full, 5 model files missing, 6 `compute=gpu`
 without a usable GPU. With `--json`, errors are
 `{"error": code, "message": text}` on stderr.
 
+## JSON output
+
+`--json` goes before the command. Every asset, wherever it appears, is the
+same object: `id` (stable across runs and reindexing), `master_id`,
+`filename`, `kind` (`image` or `movie`), `live`, `taken` and `added` (ISO
+8601, UTC), `width`, `height`, `bytes`, `favorite`, `caption`, `latitude`,
+`longitude`, `hidden`, and `versions` (the renditions iCloud offers, each with
+`bytes`, `width`, `height`, `type`, `filename`). Ranked searches add `score`.
+
+| Command | JSON on stdout |
+| --- | --- |
+| `search` | `{"results": [asset…], "count", "next_cursor"}` and `"query"` when ranked; pass `next_cursor` back as `--cursor` |
+| `info` | the asset plus `cached` (`version`, `path`, `bytes`, `pinned`), `albums`, `collections`, `faces`; an array when several ids are given |
+| `show`, `original` | `[{"id", "version", "path", "bytes", "cached", …}]`, one per id |
+| `status` | `authenticated`, `auth`, `catalog` counts, `last_sync`, `sync_running`, `sync_progress`, `cache`, `index`, `compute`, `paths` |
+| `sync`, `index` | the run's counts, or with `--background` `{"started": true, "pid", "unit", "log"}` |
+| `albums`, `people`, `faces …`, `collection …`, `cache …`, `config …` | arrays of rows or the object the text form describes |
+| `lap-export`, `lap-fetch` | counts written, or `{"id", "version", "path", "link"}` |
+
+Errors are `{"error": code, "message": text}` on stderr with a non-zero exit;
+codes are stable strings (`not-logged-in`, `cache-full`, `models-missing`,
+`compute-unavailable`, `internal-error`, …). Fields are only ever added, not
+renamed or removed, within a major version.
+
 ## An assistant's session
 
 ```sh

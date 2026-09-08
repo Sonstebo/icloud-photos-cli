@@ -578,6 +578,8 @@ class CliTest(unittest.TestCase):
 
     def test_background_sync_under_systemd_gets_its_own_unit(self):
         import shutil, time
+        if os.environ.get("ICLOUD_PHOTOS_WORKER") == "plain":
+            self.skipTest("ICLOUD_PHOTOS_WORKER=plain in this environment")
         if not shutil.which("systemd-run") or subprocess.run(
                 ["systemd-run", "--user", "--quiet", "--collect", "--wait", "true"], capture_output=True).returncode:
             self.skipTest("no usable systemd user manager")
