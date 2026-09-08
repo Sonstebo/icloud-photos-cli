@@ -26,7 +26,9 @@ at a fraction of the CPU's energy: on an Apple M1 under Asahi Linux the face
 pass draws about 12 W instead of 27 W for the same work, and is slightly
 faster. `config set compute auto|cpu|gpu` chooses; `auto` (the default) uses
 the GPU when the provider imports and a small convolution on it matches the
-CPU, and says why in `photos status` when it does not. Nothing else changes:
+CPU, and says why in `photos status` when it does not. Only `index` uses the GPU;
+queries embed their text on the CPU so they never compete with a running
+index worker. Nothing else changes:
 embeddings from either path compare at cosine 1.0000.
 
 ## Install

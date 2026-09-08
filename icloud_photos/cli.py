@@ -52,7 +52,12 @@ class App:
                  models_factory: Callable[["App"], Any] | None = None) -> None:
         self.json = json_mode
         self._models: Any = None
-        self._models_factory = models_factory or (lambda app: OnnxModels(app.paths.models_dir, compute=str(app.config.values.get("compute", "auto"))))
+        # Only the index worker takes the GPU: a query's text embedding is tiny, and a
+        # second process mapping the models on the GPU while the worker holds it has
+        # failed on Vulkan under memory pressure (2026-09-08).
+        self.gpu_allowed = False
+        self._models_factory = models_factory or (lambda app: OnnxModels(
+            app.paths.models_dir, compute=str(app.config.values.get("compute", "auto")) if app.gpu_allowed else "cpu"))
         self.paths = Paths.discover().ensure()
         self.config = Config.load(self.paths.config_file)
         self._catalog: Catalog | None = None
@@ -774,6 +779,7 @@ def main(argv: list[str] | None = None, adapter_factory: Callable[[App], Adapter
          models_factory: Callable[[App], Any] | None = None) -> int:
     args = build_parser().parse_args(argv)
     app = App(args.json, adapter_factory, models_factory)
+    app.gpu_allowed = args.fn is cmd_index
     signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         return args.fn(app, args)
