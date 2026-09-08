@@ -10,7 +10,8 @@ would have produced, so lap needs no change to browse our library:
   (`<root>/YYYY/MM/<asset id>@<stem>.jpg` -> the best cached JPEG rendition; the
   id is filename-safe as in the cache, and `@` cannot occur in it),
 - `afiles` with our dates, dimensions, GPS, favourite and caption,
-- `athumbs` from our thumbnails, within lap's thumbnail size (512 by default,
+- `athumbs` from our thumbnails (`--fetch-thumbs` downloads the missing ones,
+  movies included), within lap's thumbnail size (512 by default,
   its gallery setting; a mismatch makes lap regenerate every thumbnail),
 - `afiles.embeds` from our CLIP vectors (lap uses the same ViT-B/32 weights),
 - `persons` and `faces` from ours (both 512-d; lap clusters by cosine),
@@ -230,8 +231,33 @@ def rendition_dims(asset: dict[str, Any], version: str) -> tuple[int | None, int
     return v.get("width"), v.get("height")
 
 
+def _fetch_thumb(a: dict[str, Any], adapter: Any, cache: Cache) -> Path | None:
+    """Download the thumbnail rendition of one asset into the cache (movies have `thumb_image`)."""
+    versions = a.get("versions") or {}
+    if isinstance(versions, str):
+        versions = json.loads(versions)
+    version = "thumb" if a.get("kind") == "image" else "thumb_image"
+    if version not in versions:
+        return None
+    try:
+        data = adapter.download(a["id"], version, a.get("master_id"))
+    except Exception:  # noqa: BLE001 - one thumbnail is not worth ending the export
+        return None
+    if not data:
+        return None
+    try:
+        return cache.put(a["id"], version if a.get("kind") == "image" else "thumb", data, ".jpg")
+    except Exception:  # noqa: BLE001 - cache full: still usable for this run
+        tmp = cache.root / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        p = tmp / f"{safe_name(a['id'])}.jpg"
+        p.write_bytes(data)
+        return p
+
+
 def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None = None,
-           fetch_command: str | None = None, progress: Progress = _noop) -> dict[str, Any]:
+           fetch_command: str | None = None, fetch_thumbs: bool = False, adapter: Any = None,
+           progress: Progress = _noop) -> dict[str, Any]:
     result: dict[str, Any] = {"library": str(lap.db_path), "root": str(lap.root), "files": 0, "linked": 0,
                               "thumbs": 0, "embeddings": 0, "faces": 0, "people": 0, "collections": 0, "skipped": 0}
     album = lap.album_id()
@@ -259,8 +285,10 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             is_image = a.get("kind") == "image"
             # the file the row stands for: the best cached JPEG rendition of an image, the original of a movie
             if is_image:
-                target = cache.peek(a["id"], "medium") or cache.peek(a["id"], "thumb")
-                linked_version = "medium" if target and target.parent.name == "medium" else "thumb"
+                # the entry stands for the medium preview only: linking the thumbnail would make
+                # lap's viewer show 480 px and never ask the fetch-on-open hook for more
+                target = cache.peek(a["id"], "medium")
+                linked_version = "medium"
                 name = f"{safe_name(a['id'])}@{stem}.jpg"
             else:
                 target = cache.peek(a["id"], "original")
@@ -290,6 +318,10 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             if target is not None:
                 result["linked"] += 1
             thumb = cache.peek(a["id"], "thumb")
+            if thumb is None and fetch_thumbs and adapter is not None:
+                thumb = _fetch_thumb(a, adapter, cache)
+                if thumb is not None:
+                    result["fetched"] = result.get("fetched", 0) + 1
             if thumb is not None:
                 lap.put_thumb(fid, thumb.read_bytes(), int(target.stat().st_mtime) if target is not None else None)
                 result["thumbs"] += 1
@@ -300,7 +332,9 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             if faces:
                 # our boxes are in the pixels of the rendition the face pass saw; lap wants the linked file's
                 sw, sh = rendition_dims(a, faces[0].get("source") or "thumb")
-                lw, lh = rendition_dims(a, linked_version) if target is not None else (sw, sh)
+                lw, lh = rendition_dims(a, linked_version)
+                if not (lw and lh):
+                    lw, lh = sw, sh
                 sx = (lw / sw) if sw and lw else 1.0
                 sy = (lh / sh) if sh and lh else 1.0
                 rows = []

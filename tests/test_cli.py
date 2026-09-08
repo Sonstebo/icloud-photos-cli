@@ -684,7 +684,7 @@ class LapExportTests(unittest.TestCase):
             self.assertEqual(files, r["files"])
             self.assertGreater(files, 0)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM afiles WHERE embeds IS NOT NULL").fetchone()[0], r["embeddings"])
-            self.assertEqual(con.execute("SELECT COUNT(*) FROM athumbs").fetchone()[0], r["thumbs"])
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM athumbs WHERE error_code=0").fetchone()[0], r["thumbs"])
             self.assertEqual(con.execute("SELECT COUNT(*) FROM faces").fetchone()[0], r["faces"])
             self.assertGreater(r["faces"], 0)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM persons").fetchone()[0], r["people"])
@@ -697,9 +697,9 @@ class LapExportTests(unittest.TestCase):
             self.assertEqual(len(links), r["linked"])
             bbox = json.loads(con.execute("SELECT bbox FROM faces LIMIT 1").fetchone()[0])
             self.assertEqual(set(bbox), {"x", "y", "width", "height", "confidence"})
-            # lap-fetch: a dangling entry gets its rendition fetched and linked
-            entry = links[0]
-            entry.unlink(); entry.symlink_to(root / "nowhere.jpg")
+            # lap-fetch: an entry whose file is missing gets its rendition fetched and linked
+            folder, name = con.execute("SELECT b.path, a.name FROM afiles a JOIN afolders b ON a.folder_id=b.id WHERE a.file_type=1 LIMIT 1").fetchone()
+            entry = Path(folder) / name
             self.assertFalse(entry.exists())
             f, _ = t.run_ix("lap-fetch", str(entry), models=models)
             self.assertTrue(entry.exists())

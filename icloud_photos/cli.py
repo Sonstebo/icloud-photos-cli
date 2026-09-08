@@ -331,11 +331,13 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
 
     def progress(p: dict[str, Any]) -> None:
         if not app.json:
-            print(f"  {p['done']} of {p['total']}: {p['files']} files, {p['thumbs']} thumbs, {p['faces']} faces", file=sys.stderr)
+            print(f"  {p['done']} of {p['total']}: {p['files']} files, {p['thumbs']} thumbs ({p.get('fetched', 0)} fetched), {p['faces']} faces", file=sys.stderr)
     try:
         photos_bin = Path(sys.executable).with_name("photos")
         fetch = f"{photos_bin if photos_bin.exists() else 'photos'} lap-fetch {{path}}"
-        result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, fetch_command=fetch, progress=progress)
+        result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, fetch_command=fetch,
+                                   fetch_thumbs=args.fetch_thumbs, adapter=app.adapter if args.fetch_thumbs else None,
+                                   progress=progress)
     finally:
         lib.close()
     app.emit(result, lambda r: f"lap library {r['library']}: {r['files']} files ({r['linked']} with a cached file), "
@@ -757,6 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--root", help="album root for the symlink tree (default: <cache>/lap)")
     s.add_argument("--thumb-size", type=int, default=512, help="lap's gallery thumbnail setting: 256, 512 (default) or 1024; a mismatch makes lap regenerate every thumbnail")
     s.add_argument("--limit", type=int, help="export only the newest N assets")
+    s.add_argument("--fetch-thumbs", action="store_true", help="download thumbnails that are not cached (movies included); needs iCloud")
     s.set_defaults(fn=cmd_lap_export)
 
     s = sub.add_parser("lap-fetch", help="fetch the file behind a lap album entry (lap's fetch-on-open command)",
