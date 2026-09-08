@@ -755,7 +755,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    "symlinks under the cache. Idempotent; lap needs a restart to show the changes.")
     s.add_argument("--library", help="lap library database (default: lap's default library)")
     s.add_argument("--root", help="album root for the symlink tree (default: <cache>/lap)")
-    s.add_argument("--thumb-size", type=int, default=200, help="thumbnail size lap expects (default 200)")
+    s.add_argument("--thumb-size", type=int, default=512, help="lap's gallery thumbnail setting: 256, 512 (default) or 1024; a mismatch makes lap regenerate every thumbnail")
     s.add_argument("--limit", type=int, help="export only the newest N assets")
     s.set_defaults(fn=cmd_lap_export)
 

@@ -10,7 +10,8 @@ would have produced, so lap needs no change to browse our library:
   (`<root>/YYYY/MM/<asset id>@<stem>.jpg` -> the best cached JPEG rendition; the
   id is filename-safe as in the cache, and `@` cannot occur in it),
 - `afiles` with our dates, dimensions, GPS, favourite and caption,
-- `athumbs` from our thumbnails, scaled to lap's thumbnail size,
+- `athumbs` from our thumbnails, within lap's thumbnail size (512 by default,
+  its gallery setting; a mismatch makes lap regenerate every thumbnail),
 - `afiles.embeds` from our CLIP vectors (lap uses the same ViT-B/32 weights),
 - `persons` and `faces` from ours (both 512-d; lap clusters by cosine),
 - `acollections` from our collections.
@@ -71,10 +72,14 @@ def format_label(filename: str) -> str | None:
 
 
 def scaled_thumbnail(data: bytes, size: int) -> bytes:
-    """A JPEG whose longer side is `size`, as lap stores its own thumbnails."""
+    """A JPEG whose longer side is at most `size`, as lap stores its own
+    thumbnails; bytes already within the size are kept as they are."""
     from PIL import Image
 
-    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data))
+    if max(img.size) <= size and img.format == "JPEG":
+        return data
+    img = img.convert("RGB")
     img.thumbnail((size, size))
     out = io.BytesIO()
     img.save(out, "JPEG", quality=85)
@@ -84,7 +89,7 @@ def scaled_thumbnail(data: bytes, size: int) -> bytes:
 class LapLibrary:
     """One lap library database plus the album tree on disk."""
 
-    def __init__(self, db_path: Path, root: Path, thumb_size: int = 200) -> None:
+    def __init__(self, db_path: Path, root: Path, thumb_size: int = 512) -> None:
         self.db_path = Path(db_path)
         self.root = Path(root)
         self.thumb_size = thumb_size
@@ -92,6 +97,7 @@ class LapLibrary:
         self.db = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout=30000")
+        self.db.execute("PRAGMA foreign_keys=ON")   # lap's tables cascade: deleting a file drops its thumbnail and faces
         have = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing = [t for t in LAP_TABLES if t not in have]
         if missing:
@@ -305,6 +311,9 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                 "SELECT asset_id FROM collection_assets WHERE collection=? ORDER BY position", (c["name"],)) if r["asset_id"] in file_ids]
             lap.replace_collection(c["name"], ids)
             result["collections"] += 1
+        # thumbnails and faces whose file row is gone (from before foreign keys were on)
+        result["orphans"] = lap.db.execute("DELETE FROM athumbs WHERE file_id NOT IN (SELECT id FROM afiles)").rowcount
+        result["orphans"] += lap.db.execute("DELETE FROM faces WHERE file_id NOT IN (SELECT id FROM afiles)").rowcount
         if limit is None:
             # rows and links for assets the catalogue no longer has (or renamed entries)
             stale = lap.db.execute(
