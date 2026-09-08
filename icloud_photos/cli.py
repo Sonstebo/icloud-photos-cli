@@ -307,7 +307,7 @@ def _fetch(app: App, asset: dict[str, Any], version: str, pin: bool = False) -> 
     cached = path is not None
     if path is None:
         try:
-            data = app.adapter.download(asset["id"], version)
+            data = app.adapter.download(asset["id"], version, asset.get("master_id"))
         except NotLoggedIn as err:
             raise CliError("not-logged-in", f"{err}; run `photos login`", 3) from err
         if data is None:

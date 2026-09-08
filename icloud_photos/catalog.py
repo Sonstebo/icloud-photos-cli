@@ -210,7 +210,7 @@ class Catalog:
     def people(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute(
             "SELECT p.*, (SELECT COUNT(*) FROM face_crops f WHERE f.person_id = p.id AND f.deleted=0) AS face_crops "
-            "FROM people p WHERE p.deleted=0 ORDER BY p.verified DESC, p.name")]
+            "FROM people p WHERE p.deleted=0 ORDER BY (p.name IS NULL OR p.name = ''), face_crops DESC, p.name")]
 
     def mark_missing(self, asset_id: str, when: str | None = None) -> bool:
         cur = self.db.execute(

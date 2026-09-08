@@ -120,8 +120,9 @@ class FakeCloud:
         info.favorite = bool(asset.value("isFavorite"))
         return info
 
-    def download(self, asset_id, version):
+    def download(self, asset_id, version, master_id=None):
         a = self.assets.get(asset_id)
+        assert master_id == a.master_id, "the CLI passes the catalogue's master id so no index walk is needed"
         if a is None or version not in a.versions:
             return None
         self.downloads.append((asset_id, version))
@@ -221,7 +222,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual([a["id"] for a in self.j("search", "--album", "Trip")[0]["results"]], ["A002/x+y=="])
         people, _ = self.j("people")
         self.assertEqual([(p["name"], p["face_crops"], bool(p["verified"])) for p in people],
-                         [("Ingjerd Thürmer", 1, True), ("Thea-Oline", 2, True), ("Morfar", 0, False)])
+                         [("Thea-Oline", 2, True), ("Ingjerd Thürmer", 1, True), ("Morfar", 0, False)])
 
     def test_an_asset_arriving_before_its_master_is_still_paired(self):
         # whole_zone alternates master-first and asset-first; every asset must land

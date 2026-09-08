@@ -2,23 +2,19 @@
 
 ## Status and authorization
 
-Implementation started 2026-09-08 on the user's instruction ("start implementing"). What exists, all tested against a fake iCloud (`tests/test_cli.py`, 14 tests) and smoke-tested offline against the real pyicloud with no session:
+Implementation started 2026-09-08 on the user's instruction. The user logged in (`photos login`, Apple ID in config) and a full sync of the real library ran the same day. Verified on real data:
 
-- `icloud_photos/` package, command `photos`, installed editable in `.venv` (Python 3.14, aarch64).
-- `adapter.py`: the cloud interface and `ICloudAdapter` over pyicloud 2.7.0 (`PhotosService.all`, `iter_changes`, `sync_cursor`, `PhotoAsset.download(version)`); login delegated to `icloud auth login --session-dir`.
-- `catalog.py`: SQLite catalogue (assets, albums, cache index, collections, meta) with keyset-paged search.
-- `sync.py`: full listing on first run, change feed after, missing-marking, album membership.
-- `cache.py`: budgeted cache with LRU eviction, pinning, refusal with exit 4.
-- `cli.py`: argparse, `--json` everywhere, one-line errors, detached `sync --background`.
-- `README.md`, `systemd/` user service and timer.
+- **Library**: 33,159 assets in the catalogue (30,191 images, 2,968 movies; 67 hidden, 26 recently deleted, 222 favourites, 13,875 with GPS, 10,639 Live Photos). The index count Apple reports is 32,963; the ~100 difference is unexplained and low priority.
+- **Sync** = one resumable walk of the CloudKit zone change feed (`icloud_photos/sync.py`): 352,694 records in 67 minutes, 141,190 of them tombstones; assets paired with masters, album membership from `CPLContainerRelation`, people from `CPLPerson`, face crops from `CPLFaceCrop`. Later syncs continue from the stored token. Raw records are kept (`records` table), which makes the catalogue 1.2 GB; shrinking that (compress JSON, or drop resource URLs) is an open item.
+- **People**: 1,255 person records, 95 named, 535 with face crops; the named ones carry full and display names and a verified flag. Face crops reference a person and hold a ~15 KB crop image, but **no asset reference**: iCloud gives the who and a reference face, not which photo a face is in. Per-asset `people` lists are empty and `facesVersion` is 0 everywhere.
+- **Fetching**: `show` two thumbnails 4.5 s, `original` 4.5 s (mostly session setup), evict works. Thumbs ~480x360, medium ~2048x1536, for an ordinary photo.
+- **Tests**: `tests/test_cli.py`, 16 tests against a fake zone feed.
 
-Not yet done, and not authorised until the user says so: **logging in to the user's iCloud account and running a sync against the real library**. The one-time `photos login` needs the user at a terminal for the password and two-factor code. After that, the first real steps are `photos sync --limit 200` to look at a sample, then a full sync, then measuring listing time, catalogue size and preview sizes. Nothing so far has been verified against Apple's actual responses; field names for hidden/caption/location come from reading pyicloud's source.
+pyicloud findings, for an upstream report: (1) `PhotoAlbum.photos` stops when a page pairs fewer than half its assets with masters (the reply's record budget runs out), which ended a listing at July 2024 here; (2) descending album walks can loop at rank 0; (3) `PhotoAlbum.get(id)` falls back to iterating the whole library when the index lookup misses; (4) `PhotoAsset.favorite()` is a setter. The adapter avoids all four by using the change feed and `records/lookup`.
 
-Not started: semantic search, faces, objects, shared library, video sampling. Reuse rule applies (see Decisions): evaluate Immich's machine-learning service, PhotoPrism, rclip and the underlying models (CLIP via open_clip, InsightFace) before writing anything. RAM is 8 GB; that bounds model choice.
+Not started: semantic search, faces, objects, shared library, video sampling. Reuse rule applies (see Decisions): evaluate Immich's machine-learning service, PhotoPrism, rclip and the underlying models (CLIP via open_clip, InsightFace) before writing anything; the person records and face crops can seed a recogniser with the user's identities. RAM is 8 GB; that bounds model choice.
 
-Publishing to GitHub still requires an instruction.
-
-**Incident, 2026-09-08 ~07:00 UTC:** a probe script called `PhotoAsset.favorite()` on asset `87F67146-8DD4-4FEE-86FB-FA22B8DF98BC` (IMG_0556.JPG, taken 2002-09-18) to read the flag; in pyicloud 2.7 that method is a setter and marked the photo as a favourite in iCloud (record modified 06:59:29 UTC). The revert (`unfavorite()`) was blocked by the permission system and is left to the user. Lesson, now in `adapter.py` and a test: read CloudKit fields with `record_field_value`; `favorite()`, `unfavorite()`, `set_favorite()`, `delete()`, `add_photo()`, `upload()` are writes. Never call methods on a live `PhotoAsset` to discover what they do.
+Publishing to GitHub still requires an instruction. The systemd user timer in `systemd/` is written but not enabled.
 
 ## Decisions (2026-09-08)
 

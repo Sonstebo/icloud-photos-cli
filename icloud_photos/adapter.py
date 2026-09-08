@@ -95,7 +95,7 @@ class Adapter(Protocol):
         """Pages of zone changes after `since` (None = from the beginning), each with the token after it."""
         ...
     def asset_from_records(self, asset: RawRecord, master: RawRecord) -> AssetInfo: ...
-    def download(self, asset_id: str, version: str) -> bytes | None: ...
+    def download(self, asset_id: str, version: str, master_id: str | None = None) -> bytes | None: ...
     def albums(self) -> list[AlbumInfo]: ...
 
 
@@ -193,11 +193,32 @@ class ICloudAdapter:
                                    CKRecord.model_validate(asset.fields), library=library)
         return self._info(photo)
 
-    def download(self, asset_id: str, version: str) -> bytes | None:
-        # a fresh record: download URLs in stored records expire
-        photo = self.photos().all.get(asset_id)
-        if photo is None:
+    def download(self, asset_id: str, version: str, master_id: str | None = None) -> bytes | None:
+        """Fetch fresh records by name (download URLs in stored records expire) and download.
+
+        Not PhotoAlbum.get(): when its index lookup misses, pyicloud walks the
+        whole library looking for the id, which is minutes per photo here.
+        """
+        from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
+
+        library = self._library()
+        names = [asset_id] + ([master_id] if master_id else [])
+        found = {r.recordName: r for r in library._client.lookup(record_names=names, zone_id=CKZoneIDReq(**library.zone_id)).records
+                 if isinstance(r, CKRecord)}
+        asset = found.get(asset_id)
+        if asset is None:
             return None
+        if master_id is None:
+            ref = RawRecord(asset_id, "CPLAsset", False, None, asset.model_dump(mode="json")).master_ref
+            if not ref:
+                return None
+            more = library._client.lookup(record_names=[ref], zone_id=CKZoneIDReq(**library.zone_id)).records
+            found.update({r.recordName: r for r in more if isinstance(r, CKRecord)})
+            master_id = ref
+        master = found.get(master_id)
+        if master is None:
+            return None
+        photo = library.asset_type(self.photos(), master, asset, library=library)
         return photo.download(version)
 
     def albums(self) -> list[AlbumInfo]:
