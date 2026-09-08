@@ -8,10 +8,12 @@ and delete() are writes, not getters. Read fields with record_field_value.
 """
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol, Sequence, TypeVar
 
 
 class NotLoggedIn(Exception):
@@ -20,6 +22,33 @@ class NotLoggedIn(Exception):
 
 class CloudError(Exception):
     """iCloud answered with something we cannot use."""
+
+
+T = TypeVar("T")
+RETRY_DELAYS: tuple[float, ...] = (2, 5, 15, 45, 120)
+
+
+def retry(fn: Callable[[], T], what: str, delays: Sequence[float] = RETRY_DELAYS,
+          sleep: Callable[[float], None] = time.sleep) -> T:
+    """Call `fn`, retrying with backoff when the connection drops.
+
+    pyicloud raises several exception types for one reset connection, so any
+    failure other than our own CloudError is retried; a long index run must
+    not end because Wi-Fi blinked (it did, 2026-09-08, at image 12,165).
+    After the last delay the failure becomes a CloudError, which the CLI
+    reports as one line; the run is resumable.
+    """
+    for i, delay in enumerate((*delays, None)):
+        try:
+            return fn()
+        except CloudError:
+            raise
+        except Exception as err:  # noqa: BLE001 - see above
+            if delay is None:
+                raise CloudError(f"{what}: iCloud unreachable after {len(delays) + 1} attempts: {err}") from err
+            print(f"  {what} failed ({type(err).__name__}), attempt {i + 1}; retrying in {delay:g}s", file=sys.stderr)
+            sleep(delay)
+    raise AssertionError("unreachable")
 
 
 @dataclass
@@ -236,12 +265,12 @@ class ICloudAdapter:
 
         def fetch(photo: Any) -> bytes | None:
             url = photo.download_url(version)
-            return client.download_asset_bytes(url) if url else None
+            return retry(lambda: client.download_asset_bytes(url), "download") if url else None
 
         for i in range(0, len(items), 50):
             batch = items[i:i + 50]
             names = [n for pair in batch for n in pair]
-            found = {r.recordName: r for r in client.lookup(record_names=names, zone_id=zone).records
+            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=names, zone_id=zone), "record lookup").records
                      if isinstance(r, CKRecord)}
             photos = []
             for asset_id, master_id in batch:
@@ -271,7 +300,8 @@ class ICloudAdapter:
 
         for i in range(0, len(crop_ids), 50):
             batch = crop_ids[i:i + 50]
-            found = {r.recordName: r for r in client.lookup(record_names=batch, zone_id=zone).records if isinstance(r, CKRecord)}
+            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=batch, zone_id=zone), "record lookup").records
+                     if isinstance(r, CKRecord)}
             urls = {cid: url_of(found[cid]) for cid in batch if cid in found}
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures = {cid: pool.submit(client.download_asset_bytes, url) for cid, url in urls.items() if url}

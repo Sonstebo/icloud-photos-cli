@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from icloud_photos import cli
-from icloud_photos.adapter import AlbumInfo, AssetInfo, RawRecord
+from icloud_photos.adapter import AlbumInfo, AssetInfo, CloudError, RawRecord, retry
 
 ROOT = Path(__file__).resolve().parent.parent
 T0 = datetime(2019, 7, 20, 12, 0, tzinfo=timezone.utc)
@@ -593,3 +593,26 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryTests(unittest.TestCase):
+    def test_retry_recovers_from_dropped_connections_then_gives_up(self):
+        calls, slept = [], []
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            return "ok"
+        self.assertEqual(retry(flaky, "lookup", delays=(1, 2, 3), sleep=slept.append), "ok")
+        self.assertEqual(slept, [1, 2])
+        def down():
+            raise OSError("no route")
+        with self.assertRaises(CloudError) as ctx:
+            retry(down, "lookup", delays=(1, 2), sleep=slept.append)
+        self.assertIn("after 3 attempts", str(ctx.exception))
+        self.assertEqual(slept, [1, 2, 1, 2])
+        def not_cloud():
+            raise CloudError("bad answer")
+        with self.assertRaises(CloudError):
+            retry(not_cloud, "lookup", delays=(1,), sleep=slept.append)
+        self.assertEqual(slept, [1, 2, 1, 2])   # our own errors are not retried
