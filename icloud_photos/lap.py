@@ -147,7 +147,10 @@ class LapLibrary:
                               [folder_id, name] + [values[c] for c in cols])
         return int(cur.lastrowid)
 
-    def put_thumb(self, file_id: int, data: bytes) -> None:
+    def put_thumb(self, file_id: int, data: bytes, source_mtime: int | None) -> None:
+        """`source_mtime` is the linked file's modification time in seconds: lap
+        treats a thumbnail whose recorded mtime differs from the file's as stale
+        and regenerates it, which for 33k entries is what made it unresponsive."""
         now = int(time.time())
         try:
             data = scaled_thumbnail(data, self.thumb_size)
@@ -155,7 +158,7 @@ class LapLibrary:
             pass
         self.db.execute(
             "INSERT OR REPLACE INTO athumbs (file_id, error_code, thumb_data, thumb_key, thumb_mtime, thumb_size, updated_at) VALUES (?,0,?,NULL,?,?,?)",
-            (file_id, data, now, self.thumb_size, now))
+            (file_id, data, source_mtime if source_mtime is not None else now, self.thumb_size, now))
 
     # --- people and collections ------------------------------------------------
     def person_id(self, name: str) -> int:
@@ -280,7 +283,7 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                 result["linked"] += 1
             thumb = cache.peek(a["id"], "thumb")
             if thumb is not None:
-                lap.put_thumb(fid, thumb.read_bytes())
+                lap.put_thumb(fid, thumb.read_bytes(), int(target.stat().st_mtime) if target is not None else None)
                 result["thumbs"] += 1
             if faces:
                 # our boxes are in the pixels of the rendition the face pass saw; lap wants the linked file's
