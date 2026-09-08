@@ -1,0 +1,8 @@
+# account data, caches, credentials never go in git
+*.db
+*.sqlite*
+cache/
+originals/
+session/
+.venv/
+__pycache__/
