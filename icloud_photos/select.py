@@ -220,7 +220,7 @@ def _ensure_everyone(picked: list[dict[str, Any]], pool: list[dict[str, Any]],
     return picked, missing
 
 
-def run(catalog: Any, *, query: str | None = None, count: int = 9,
+def run(catalog: Any, *, query: str | None = None, query_vector: bytes | None = None, count: int = 9,
         filters: dict[str, Any] | None = None, controls: Controls | None = None,
         embed: Embedder | None = None, thumb_for: ThumbFor | None = None,
         people_required: Sequence[str] = ()) -> Selection:
@@ -247,9 +247,12 @@ def run(catalog: Any, *, query: str | None = None, count: int = 9,
     # the filters applied to those: ranking a pool of the newest few hundred would
     # answer a different question than the one asked.
     rel: dict[str, float] = {}
-    if query and embed is not None:
+    # Either a description or a photograph can be the thing to be near; the rest
+    # of the funnel does not care which.
+    anchor = query_vector if query_vector is not None else (embed(query) if (query and embed) else None)
+    if anchor is not None:
         scan = min(max(pool_size * 6, 1200), NEAREST_SCAN_MAX)
-        nearest = catalog.nearest_clip(embed(query), scan)
+        nearest = catalog.nearest_clip(anchor, scan)
         score = {aid: 1.0 - d * d / 2.0 for aid, d in nearest}      # L2 on unit vectors -> cosine
         rows, _ = catalog.search(ids=list(score), limit=max(len(score), 1), **filters)
         rows = [a for a in rows if score.get(a["id"], -1.0) >= controls.floor]
@@ -261,7 +264,8 @@ def run(catalog: Any, *, query: str | None = None, count: int = 9,
         rows.sort(key=lambda a: -score.get(a["id"], 0.0))
         rows = rows[:pool_size]
         rel = {a["id"]: score.get(a["id"], 0.0) for a in rows}
-        out.stages.append(Stage("meaning", len(rows), f"nearest {scan:,} to {query!r}, then filtered"))
+        near = repr(query) if query else "this photo"
+        out.stages.append(Stage("meaning", len(rows), f"nearest {scan:,} to {near}, then filtered"))
     else:
         rows, _ = catalog.search(limit=pool_size, **filters)
         rel = {a["id"]: 0.5 for a in rows}
@@ -298,7 +302,7 @@ def run(catalog: Any, *, query: str | None = None, count: int = 9,
         out.stages.append(Stage("sharp only", len(rows), f"{before - len(rows)} soft frames dropped"))
 
     # Meaning and quality together decide relevance; your own favourites carry weight.
-    use_meaning = bool(query and embed)
+    use_meaning = anchor is not None
     blended = {a["id"]: (0.75 * rel[a["id"]] + 0.25 * qual[a["id"]]) if use_meaning
                else qual[a["id"]] for a in rows}
 

@@ -710,6 +710,13 @@ def cmd_select(app: App, args: argparse.Namespace) -> int:
         variety=args.variety, spread=args.spread, everyone=args.everyone,
         sharp_only=args.sharp_only, duplicates=args.keep_duplicates, floor=args.floor)
 
+    anchor = None
+    if args.similar:
+        anchor = app.catalog.clip_of(_asset_for(app, args.similar)["id"])
+        if anchor is None:
+            raise CliError("not-indexed",
+                           f"{args.similar} has no embedding yet; run `photos index`")
+
     embed = None
     if args.query:
         if not app.catalog.vec:
@@ -722,7 +729,8 @@ def cmd_select(app: App, args: argparse.Namespace) -> int:
                 raise CliError("models-missing", str(err), 5) from err
 
     result = selector.run(
-        app.catalog, query=args.query, count=args.count, filters=filters, controls=controls,
+        app.catalog, query=args.query, query_vector=anchor, count=args.count,
+        filters=filters, controls=controls,
         embed=embed, thumb_for=lambda aid: app.cache.peek(aid, "thumb"),
         people_required=people if args.everyone else ())
 
@@ -1274,6 +1282,9 @@ def build_parser() -> argparse.ArgumentParser:
                                    "quotas. Every stage reports what it removed, so an empty "
                                    "result can be explained. Images only unless --kind says otherwise.")
     s.add_argument("query", nargs="?", help="describe the picture you want (ranked by CLIP)")
+    s.add_argument("--similar", metavar="ID",
+                   help="grow a set around this photo instead of a description; "
+                        "an id or a GUI album entry path")
     s.add_argument("--count", type=int, default=9, metavar="N", help="how many to choose (default 9)")
     s.add_argument("--since", metavar="DATE"); s.add_argument("--until", metavar="DATE")
     s.add_argument("--kind", choices=("image", "movie"))

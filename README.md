@@ -114,7 +114,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `sync [--full] [--background]` | update the catalogue: assets, albums, people, face crops | yes |
 | `albums` | albums in the catalogue with counts | no |
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
-| `select [QUERY] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
+| `select [QUERY] [--similar ID] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
 | `compose [COLLECTION] [--id ID...] [--template justified\|grid\|hero\|filmstrip\|spread\|scatter] [--shape 3:2\|square\|a4-landscape\|a4-portrait\|spread\|16:9] [--gap N] [--count N] [--background C] [--long-edge PX] [--originals] [--no-face-safe] [--plan] [--out FILE]` | turn a set of photos into one picture; no crop cuts a face | only with `--originals` |
 | `book list\|create\|delete\|add\|remove\|move\|show\|export` | ordered pages of collages, exported as one PDF | only with `--originals` |
 | `info ID...` | every field, cached renditions, albums, collections | no |
@@ -253,6 +253,10 @@ Two photos count as the same picture only when they look alike **and** were
 taken within ninety seconds, so a burst collapses to its best frame while the
 same wall photographed a year apart does not. The keeper is decided by focus,
 except that anything you marked as a favourite outranks any measurement.
+
+`--similar ID` grows a set around one photograph instead of a description,
+which is what "more like this" means: the same funnel, anchored on a picture
+rather than on words.
 
 `--spread day` stops a week's trip coming out as one Tuesday afternoon.
 `--person` may be repeated to pool several people, and `--everyone` then
