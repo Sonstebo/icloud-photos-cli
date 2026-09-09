@@ -704,6 +704,12 @@ class LapExportTests(unittest.TestCase):
             f, _ = t.run_ix("lap-fetch", str(entry), models=models)
             self.assertTrue(entry.exists())
             self.assertEqual(os.readlink(entry), f["path"])
+            # the album is marked so the app never scans it away, and the entry is
+            # named after the rendition it stands for
+            self.assertEqual(con.execute("SELECT managed FROM albums").fetchone()[0], 1)
+            self.assertTrue(r["managed"])
+            names = [n for (n,) in con.execute("SELECT name FROM afiles")]
+            self.assertTrue(all("@" in n for n in names), names[:3])
             # idempotent: a second run changes no counts
             r2, _ = t.run_ix("lap-export", "--library", str(lap_db), "--root", str(root), models=models)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM afiles").fetchone()[0], files)

@@ -226,6 +226,17 @@ embedding and for faces that fill a fair part of the frame. Small faces in
 group shots need the medium rendition; the index records the source of each
 result so a later pass can redo those. Movies are not indexed yet.
 
+## What the GUI does not do
+
+- **Favourites come from iCloud.** Toggling one in the app is overwritten by the
+  next refresh; the CLI never writes to iCloud. Ratings, tags and the app's own
+  collections are left alone.
+- **Collections travel one way**, from here into the app.
+- **Keeping a file offline** is `photos original ID --pin`; there is no button
+  for it in the app yet.
+- **62 RAW imports have no thumbnail** until you open one: iCloud offers only
+  their 20 MB original, so nothing small exists to make one from.
+
 ## Not yet
 
 Pass 2 on medium previews, objects beyond what CLIP understands, shared

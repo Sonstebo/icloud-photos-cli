@@ -169,3 +169,7 @@ CREATE INDEX idx_faces_person_id ON faces(person_id);
 CREATE INDEX idx_persons_name ON persons(name);
 CREATE UNIQUE INDEX uidx_afiles_folder_id_name
             ON afiles(folder_id, name);
+
+-- migrations 17 and 18, which the export needs
+ALTER TABLE albums ADD COLUMN fetch_command TEXT;
+ALTER TABLE albums ADD COLUMN managed INTEGER NOT NULL DEFAULT 0;
