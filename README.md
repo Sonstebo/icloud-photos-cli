@@ -116,7 +116,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `select [QUERY] [--similar ID] [--person P] [--include-screenshots] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
 | `compose [COLLECTION] [--id ID...] [--template justified\|grid\|hero\|filmstrip\|spread\|scatter] [--shape 3:2\|square\|a4-landscape\|a4-portrait\|spread\|16:9] [--gap N] [--count N] [--background C] [--long-edge PX] [--originals] [--no-face-safe] [--plan] [--out FILE]` | turn a set of photos into one picture; no crop cuts a face | only with `--originals` |
-| `book list\|create\|delete\|add\|remove\|move\|show\|export` | ordered pages of collages, exported as one PDF | only with `--originals` |
+| `book list\|create\|delete\|add\|remove\|move\|show\|preflight\|export` | ordered pages of collages, exported as one PDF | only with `--originals` |
 | `info ID...` | every field, cached renditions, albums, collections | no |
 | `show ID... [--size thumb\|medium]` | fetch previews, print `id<TAB>path` | if not cached |
 | `original ID... [--pin] [--version V]` | fetch full files, print paths | if not cached |
@@ -393,6 +393,34 @@ one group held the same child from a baby photograph in 2008 to a portrait in
 
 `photos faces crop` writes a JPEG of a face, which is how an interface shows you
 who it is asking about.
+
+## Before you pay for a book
+
+A print shop's uploader will take a page happily and print it soft, and the
+first anyone knows is when the book arrives. `photos book preflight` says so
+first, and it can, because it knows what went into every page: which
+photograph, at what size, cropped how, and where the faces are.
+
+```
+$ photos book preflight "Summer 2024" --profile a4-landscape
+Summer 2024 on A4 landscape, 3 pages, 3508x2480 px at 300 dpi
+  nothing to fix; this book is ready to order
+```
+
+Three things are caught, in the order they ruin a book. A photograph with too
+few pixels for the space it was given: 2,200 pixels across an A4 page is 188 dpi
+and visibly soft, below 150 it is a smudge and the book will not pass. A face
+close enough to the trim that the cut may take part of it. And, on a spread, a
+face sitting in the spine, which will bend into it.
+
+Resolution is judged on the **original**, not on the cached preview the page was
+drawn from. Judging the print by the preview would call every page fine and every
+book soft.
+
+A shop's page is a profile, which is data: page size in millimetres, bleed, safe
+margin, resolution, accepted formats. `a4-landscape`, `a4-portrait`,
+`square-210`, `square-300`, `a4-spread` and `screen` ship with it, and another
+shop is one more entry.
 
 ## Editing a photo by asking
 

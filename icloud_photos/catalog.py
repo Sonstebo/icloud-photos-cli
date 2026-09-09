@@ -18,6 +18,9 @@ from .adapter import AssetInfo
 
 SCHEMA_VERSION = 1
 
+# How long to wait for another process's write lock before giving up.
+BUSY_TIMEOUT_S = 60.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS assets (
@@ -149,8 +152,13 @@ class Catalog:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None)  # autocommit; explicit BEGIN below
+        # Wait for a lock rather than fail at it. A sync holds the write lock for a
+        # page at a time, and Python's five-second default meant that opening a
+        # photo during a sync failed with "database is locked", which the app could
+        # only report as a missing or corrupt file.
+        self.db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, isolation_level=None)
         self.db.row_factory = sqlite3.Row
+        self.db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)

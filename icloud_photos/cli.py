@@ -875,6 +875,11 @@ def cmd_compose(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_profiles() -> list[str]:
+    from . import printing
+    return list(printing.PROFILES)
+
+
 def _book_or_fail(app: App, name: str) -> dict[str, Any]:
     book = app.catalog.book(name)
     if book is None:
@@ -936,6 +941,50 @@ def cmd_book(app: App, args: argparse.Namespace) -> int:
                       f"{p['collection'] or str(len(p['ids'] or [])) + ' photos'}"
                       + (f"  \u2014 {p['caption']}" if p["caption"] else "")
                       for p in r["pages"]] or ["  no pages yet"]))
+    elif cmd == "preflight":
+        from . import printing
+
+        book = _book_or_fail(app, args.name)
+        profile = printing.PROFILES.get(args.profile)
+        if profile is None:
+            raise CliError("unknown-profile",
+                           f"no profile {args.profile!r}; try " + ", ".join(printing.PROFILES))
+        pages = app.catalog.book_pages(args.name)
+        if not pages:
+            raise CliError("empty-book", f"{args.name} has no pages")
+        fetched: list[str] = []
+        laid: list[dict[str, Any]] = []
+        for page in pages:
+            if page["collection"]:
+                assets = app.catalog.collection_items(page["collection"])
+            else:
+                assets = [_asset_for(app, i) for i in (page["ids"] or [])]
+            assets = [a for a in assets if a["kind"] == "image"]
+            if not assets:
+                continue
+            photos = [_compose_photo(app, a, False, fetched) for a in assets]
+            plan = composer.plan(photos, template=page["template"], shape=book["shape"])
+            by_id = {a["id"]: a for a in assets}
+            # how much of the *original* survives the crop, across the slot's width
+            source_px: dict[str, int] = {}
+            for photo, slot in zip(photos, plan["slots"]):
+                a = by_id.get(photo.id) or {}
+                original_w = int(a.get("width") or 0) or photo.width
+                fraction = (slot["crop"]["w"] / photo.width) if photo.width else 1.0
+                source_px[photo.id] = int(round(original_w * fraction))
+            faces = {p.id: p.faces for p in photos}
+            laid.append({"findings": printing.check_page(
+                page["position"], plan, source_px, faces, profile)})
+        report = printing.check_book(laid, profile)
+        report["book"] = args.name
+        app.emit(report, lambda r: "\n".join(
+            [f"{r['book']} on {r['profile']['label']}, {r['pages']} pages, "
+             f"{r['profile']['page_px'][0]}x{r['profile']['page_px'][1]} px at {r['profile']['dpi']} dpi"] +
+            [f"  {'STOP' if f['severity'] == 'stop' else 'look'}  page {f['page']}: {f['message']}"
+             for f in r["findings"]] +
+            ["  nothing to fix; this book is ready to order" if r["ready"]
+             else f"  {r['stop']} things to fix before ordering"]))
+        return 0
     elif cmd == "export":
         book = _book_or_fail(app, args.name)
         pages = app.catalog.book_pages(args.name)
@@ -1514,6 +1563,11 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("name"); x.add_argument("--page", type=int, required=True)
     x.add_argument("--to", type=int, required=True)
     x = bk.add_parser("show", help="the pages in order"); x.add_argument("name")
+    x = bk.add_parser("preflight", help="what will go wrong at the printer, before you pay")
+    x.add_argument("name")
+    x.add_argument("--profile", default="a4-landscape",
+                   help="the print shop's page: " + ", ".join(_print_profiles()))
+    x.set_defaults(fn=cmd_book)
     x = bk.add_parser("export", help="draw every page and bind them into a PDF")
     x.add_argument("name")
     x.add_argument("--out", metavar="FILE", help="write here instead of the dated folder")

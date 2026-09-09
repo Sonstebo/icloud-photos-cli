@@ -1659,3 +1659,126 @@ class SharedLibraryTests(CliTest):
         r, _ = self.j("sync")
         self.assertEqual(r["mode"], "changes", "an old cursor still means an incremental sync")
         self.assertEqual(r["records"], 0, "and nothing is walked again")
+
+    def test_the_catalogue_waits_for_a_lock_instead_of_failing_at_it(self):
+        # Opening a photo while a sync runs used to fail with "database is locked",
+        # which the app could only report as a missing or corrupt file.
+        from icloud_photos.catalog import BUSY_TIMEOUT_S
+        self.assertGreaterEqual(BUSY_TIMEOUT_S, 30,
+                                "five seconds is not long enough to outlast a sync's page")
+        self.j("sync")
+        from icloud_photos.cli import App
+        app = App(json_mode=True)
+        try:
+            self.assertEqual(app.catalog.db.execute("PRAGMA busy_timeout").fetchone()[0],
+                             int(BUSY_TIMEOUT_S * 1000))
+        finally:
+            app.close()
+
+
+# --- getting a book ready for a print shop -----------------------------------
+
+class PreflightTests(unittest.TestCase):
+    """The check that comes before the money."""
+
+    def setUp(self):
+        from icloud_photos import printing
+        self.pr = printing
+        self.a4 = printing.PROFILES["a4-landscape"]
+
+    def full_page(self, pid="p"):
+        w, h = self.a4.page_px
+        return {"width": w, "height": h,
+                "slots": [{"id": pid, "x": 0, "y": 0, "w": w, "h": h,
+                           "crop": {"w": w, "h": h, "x": 0, "y": 0}}]}
+
+    def test_a_page_size_in_millimetres_becomes_the_right_pixels(self):
+        self.assertEqual(self.a4.page_px, (3508, 2480))       # A4 at 300 dpi
+        self.assertEqual(self.pr.PROFILES["a4-portrait"].page_px, (2480, 3508))
+        self.assertEqual(self.a4.bleed_px, 35)                # 3 mm
+
+    def test_a_photograph_with_enough_pixels_passes(self):
+        found = self.pr.check_page(1, self.full_page(), {"p": 4032}, {}, self.a4)
+        self.assertEqual(found, [])
+
+    def test_one_that_will_print_soft_is_flagged_and_a_smudge_stops_the_book(self):
+        # 2200 px across 297 mm is 188 dpi: past soft, short of hopeless
+        soft = self.pr.check_page(1, self.full_page(), {"p": 2200}, {}, self.a4)
+        self.assertEqual([f.severity for f in soft], ["look"])
+        self.assertIn("soft", soft[0].message)
+
+        bad = self.pr.check_page(1, self.full_page(), {"p": 1200}, {}, self.a4)
+        self.assertEqual([f.severity for f in bad], ["stop"])
+        self.assertIn("smudge", bad[0].message)
+
+    def test_the_measurement_is_pixels_per_inch_of_the_space_it_fills(self):
+        # 3508 px across 297 mm is 300 dpi; half the pixels is half the dpi
+        page = self.full_page()
+        self.assertEqual(self.pr.check_page(1, page, {"p": 3508}, {}, self.a4), [])
+        half = self.pr.check_page(1, page, {"p": 1754}, {}, self.a4)
+        self.assertIn("150 dpi", half[0].message)
+
+    def test_a_small_photograph_in_a_small_slot_is_fine(self):
+        # the same photograph that fails full-page passes at a quarter of the width
+        w, h = self.a4.page_px
+        page = {"width": w, "height": h,
+                "slots": [{"id": "p", "x": 0, "y": 0, "w": w // 4, "h": h // 4,
+                           "crop": {"w": 800, "h": 600, "x": 0, "y": 0}}]}
+        self.assertEqual(self.pr.check_page(1, page, {"p": 1200}, {}, self.a4), [])
+
+    def test_a_face_reaching_the_trim_stops_the_book(self):
+        safe = self.pr.check_page(1, self.full_page(), {"p": 4032},
+                                  {"p": [[0.4, 0.4, 0.6, 0.6]]}, self.a4)
+        self.assertEqual(safe, [])
+        edge = self.pr.check_page(1, self.full_page(), {"p": 4032},
+                                  {"p": [[0.001, 0.4, 0.06, 0.6]]}, self.a4)
+        self.assertEqual([f.kind for f in edge], ["trim"])
+        self.assertEqual(edge[0].severity, "stop")
+
+    def test_a_face_in_the_spine_of_a_spread_is_worth_a_look(self):
+        spread = self.pr.PROFILES["a4-spread"]
+        w, h = spread.page_px
+        page = {"width": w, "height": h,
+                "slots": [{"id": "p", "x": 0, "y": 0, "w": w, "h": h,
+                           "crop": {"w": w, "h": h, "x": 0, "y": 0}}]}
+        found = self.pr.check_page(1, page, {"p": 6000}, {"p": [[0.47, 0.3, 0.53, 0.5]]}, spread)
+        self.assertEqual([f.kind for f in found], ["gutter"])
+        self.assertEqual(found[0].severity, "look")
+
+    def test_nothing_cached_to_measure_is_said_rather_than_assumed_fine(self):
+        found = self.pr.check_page(1, self.full_page(), {}, {}, self.a4)
+        self.assertEqual([f.severity for f in found], ["look"])
+        self.assertIn("nothing cached", found[0].message)
+
+    def test_a_book_is_ready_only_when_nothing_stops_it(self):
+        stop = self.pr.Finding(1, "resolution", "stop", "too few pixels")
+        look = self.pr.Finding(2, "gutter", "look", "in the spine")
+        clean = self.pr.check_book([{"findings": [look]}], self.a4)
+        self.assertTrue(clean["ready"])
+        self.assertEqual((clean["stop"], clean["look"]), (0, 1))
+        blocked = self.pr.check_book([{"findings": [stop, look]}], self.a4)
+        self.assertFalse(blocked["ready"])
+
+    def test_a_shop_that_counts_pages_is_obeyed(self):
+        r = self.pr.check_book([{"findings": []}] * 6, self.a4, multiple_of=4, minimum=8)
+        self.assertFalse(r["ready"])
+        msgs = " ".join(f["message"] for f in r["findings"])
+        self.assertIn("at least 8", msgs)
+        self.assertIn("multiple of 4", msgs)
+
+
+class PreflightCliTests(CliTest):
+    def test_preflight_reports_the_page_it_would_print_on(self):
+        self.j("sync")
+        self.j("collection", "create", "Trip")
+        self.j("collection", "add", "Trip", "A001/x+y==", "A002/x+y==")
+        self.j("book", "create", "Summer")
+        self.j("book", "add", "Summer", "--collection", "Trip")
+        _, err = self.j("book", "preflight", "Summer", "--profile", "nonesuch", expect=1)
+        self.assertIn("unknown-profile", err)
+
+    def test_preflight_refuses_a_book_with_no_pages(self):
+        self.j("sync")
+        self.j("book", "create", "Empty")
+        _, err = self.j("book", "preflight", "Empty", expect=1)
+        self.assertIn("empty-book", err)

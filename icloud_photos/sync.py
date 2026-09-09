@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -20,6 +21,12 @@ from .catalog import Catalog, now
 
 Progress = Callable[[dict[str, Any]], None]
 KEPT_TYPES = {"CPLAsset", "CPLMaster", "CPLContainerRelation", "CPLPerson", "CPLFaceCrop"}
+
+
+# A page's worth of records is one write transaction, and pages come back to
+# back. Without a pause between them an interactive fetch waits for the whole
+# sync: opening a photo has to be able to get in edgeways.
+YIELD_BETWEEN_PAGES_S = 0.01
 
 
 def _noop(_: dict[str, Any]) -> None:
@@ -125,6 +132,8 @@ def _walk(catalog: Catalog, adapter: Adapter, zone: Any, token: str | None,
             catalog.set_meta("cursor", next_token)   # the old key, for anything still reading it
         catalog.set_meta("sync_progress", json.dumps(result))
         catalog.db.execute("COMMIT")
+        if YIELD_BETWEEN_PAGES_S:
+            time.sleep(YIELD_BETWEEN_PAGES_S)
         progress(result)
 
 
