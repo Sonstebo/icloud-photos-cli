@@ -86,6 +86,20 @@ class AssetInfo:
         return repr(sorted(d.items()))
 
 
+@dataclass(frozen=True)
+class ZoneInfo:
+    """One CloudKit zone. `PrimarySync` is the user's own library; a `SharedSync-...`
+    zone is a shared library they take part in."""
+
+    name: str
+    owner: str | None = None
+    kind: str | None = None
+
+    @property
+    def shared(self) -> bool:
+        return self.name.startswith("SharedSync")
+
+
 @dataclass
 class AlbumInfo:
     id: str
@@ -120,12 +134,16 @@ class RawRecord:
 
 class Adapter(Protocol):
     def auth_status(self) -> dict[str, Any]: ...
-    def iter_zone(self, since: str | None) -> Iterator[tuple[list[RawRecord], str | None]]:
+    def zones(self) -> list["ZoneInfo"]: ...
+    def iter_zone(self, since: str | None, zone: "ZoneInfo | None" = None
+                  ) -> Iterator[tuple[list[RawRecord], str | None]]:
         """Pages of zone changes after `since` (None = from the beginning), each with the token after it."""
         ...
     def asset_from_records(self, asset: RawRecord, master: RawRecord) -> AssetInfo: ...
-    def download(self, asset_id: str, version: str, master_id: str | None = None) -> bytes | None: ...
-    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
+    def download(self, asset_id: str, version: str, master_id: str | None = None,
+                 zone: str | None = None) -> bytes | None: ...
+    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4,
+                      zone: str | None = None) -> Iterator[tuple[str, bytes | None]]:
         """(asset_id, master_id) pairs -> (asset_id, bytes); one lookup per batch, downloads in parallel."""
         ...
     def download_face_crops(self, crop_ids: list[str], threads: int = 4) -> Iterator[tuple[str, bytes | None]]: ...
@@ -202,11 +220,55 @@ class ICloudAdapter:
     def _library(self) -> Any:
         return self.photos().libraries["root"]
 
-    def iter_zone(self, since: str | None) -> Iterator[tuple[list[RawRecord], str | None]]:
+    def zones(self) -> list[ZoneInfo]:
+        """Every zone the account can read, the user's own library first.
+
+        A shared library is a second zone. Its photos are not in `PrimarySync` at
+        all, so a library that ignores it is simply missing them.
+        """
+        library = self._library()
+        own = ZoneInfo(**{k: v for k, v in
+                          (("name", library.zone_id.get("zoneName")),
+                           ("owner", library.zone_id.get("ownerRecordName")),
+                           ("kind", library.zone_id.get("zoneType"))) if v is not None})
+        found = [own]
+        try:
+            listed = library._client.zones_list().zones or []
+        except Exception as err:  # noqa: BLE001
+            raise CloudError(f"could not list the account's zones: {err}") from err
+        for z in listed:
+            zid = getattr(z, "zoneID", z)
+            name = getattr(zid, "zoneName", None)
+            if not name or name == own.name:
+                continue
+            found.append(ZoneInfo(name, getattr(zid, "ownerRecordName", None),
+                                  getattr(zid, "zoneType", None)))
+        return found
+
+    def _zone_id(self, zone: ZoneInfo | str | None) -> dict[str, Any]:
+        library = self._library()
+        if zone is None:
+            return dict(library.zone_id)
+        name = zone if isinstance(zone, str) else zone.name
+        if name == library.zone_id.get("zoneName"):
+            return dict(library.zone_id)
+        for z in self.zones():
+            if z.name == name:
+                out = {"zoneName": z.name}
+                if z.owner:
+                    out["ownerRecordName"] = z.owner
+                if z.kind:
+                    out["zoneType"] = z.kind
+                return out
+        raise CloudError(f"no zone named {name!r} on this account")
+
+    def iter_zone(self, since: str | None, zone: ZoneInfo | None = None
+                  ) -> Iterator[tuple[list[RawRecord], str | None]]:
         from pyicloud.common.cloudkit import CKRecord, CKZoneChangesZoneReq, CKZoneID
 
         library = self._library()
-        zone_req = CKZoneChangesZoneReq(zoneID=CKZoneID(**library.zone_id), syncToken=since, reverse=False)
+        zone_req = CKZoneChangesZoneReq(zoneID=CKZoneID(**self._zone_id(zone)),
+                                        syncToken=since, reverse=False)
         for zone in library._client.iter_changes(zone_req=zone_req):
             page = []
             for rec in zone.records:
@@ -226,7 +288,8 @@ class ICloudAdapter:
                                    CKRecord.model_validate(asset.fields), library=library)
         return self._info(photo)
 
-    def download(self, asset_id: str, version: str, master_id: str | None = None) -> bytes | None:
+    def download(self, asset_id: str, version: str, master_id: str | None = None,
+                 zone: str | None = None) -> bytes | None:
         """Fetch fresh records by name (download URLs in stored records expire) and download.
 
         Not PhotoAlbum.get(): when its index lookup misses, pyicloud walks the
@@ -236,7 +299,8 @@ class ICloudAdapter:
 
         library = self._library()
         names = [asset_id] + ([master_id] if master_id else [])
-        found = {r.recordName: r for r in library._client.lookup(record_names=names, zone_id=CKZoneIDReq(**library.zone_id)).records
+        zone_id = CKZoneIDReq(**self._zone_id(zone))
+        found = {r.recordName: r for r in library._client.lookup(record_names=names, zone_id=zone_id).records
                  if isinstance(r, CKRecord)}
         asset = found.get(asset_id)
         if asset is None:
@@ -245,7 +309,7 @@ class ICloudAdapter:
             ref = RawRecord(asset_id, "CPLAsset", False, None, asset.model_dump(mode="json")).master_ref
             if not ref:
                 return None
-            more = library._client.lookup(record_names=[ref], zone_id=CKZoneIDReq(**library.zone_id)).records
+            more = library._client.lookup(record_names=[ref], zone_id=zone_id).records
             found.update({r.recordName: r for r in more if isinstance(r, CKRecord)})
             master_id = ref
         master = found.get(master_id)
@@ -254,13 +318,14 @@ class ICloudAdapter:
         photo = library.asset_type(self.photos(), master, asset, library=library)
         return photo.download(version)
 
-    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4) -> Iterator[tuple[str, bytes | None]]:
+    def download_many(self, items: list[tuple[str, str]], version: str, threads: int = 4,
+                      zone: str | None = None) -> Iterator[tuple[str, bytes | None]]:
         from concurrent.futures import ThreadPoolExecutor
 
         from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
 
         library = self._library()
-        zone = CKZoneIDReq(**library.zone_id)
+        zone_id = CKZoneIDReq(**self._zone_id(zone))
         client = library._client
 
         def fetch(photo: Any) -> bytes | None:
@@ -270,7 +335,7 @@ class ICloudAdapter:
         for i in range(0, len(items), 50):
             batch = items[i:i + 50]
             names = [n for pair in batch for n in pair]
-            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=names, zone_id=zone), "record lookup").records
+            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=names, zone_id=zone_id), "record lookup").records
                      if isinstance(r, CKRecord)}
             photos = []
             for asset_id, master_id in batch:
@@ -291,7 +356,9 @@ class ICloudAdapter:
         from pyicloud.common.cloudkit import CKRecord, CKZoneIDReq
 
         library = self._library()
-        zone = CKZoneIDReq(**library.zone_id)
+        # People and their reference crops belong to the user's own library; a
+        # shared zone carries photographs and nothing else.
+        zone_id = CKZoneIDReq(**self._zone_id(None))
         client = library._client
 
         def url_of(rec: Any) -> str | None:
@@ -300,7 +367,7 @@ class ICloudAdapter:
 
         for i in range(0, len(crop_ids), 50):
             batch = crop_ids[i:i + 50]
-            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=batch, zone_id=zone), "record lookup").records
+            found = {r.recordName: r for r in retry(lambda: client.lookup(record_names=batch, zone_id=zone_id), "record lookup").records
                      if isinstance(r, CKRecord)}
             urls = {cid: url_of(found[cid]) for cid in batch if cid in found}
             with ThreadPoolExecutor(max_workers=threads) as pool:

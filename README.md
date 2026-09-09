@@ -111,7 +111,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | --- | --- | --- |
 | `login [--username ID] [--logout]` | sign in through pyicloud's CLI; needs a terminal | yes |
 | `status [--offline]` | auth state, catalogue counts, cache usage, sync progress | unless `--offline` |
-| `sync [--full] [--background]` | update the catalogue: assets, albums, people, face crops | yes |
+| `sync [--full] [--background] [--no-shared]` | update the catalogue from every zone the account can read, shared libraries included | yes |
 | `albums` | albums in the catalogue with counts | no |
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `select [QUERY] [--similar ID] [--person P] [--include-screenshots] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
@@ -229,6 +229,24 @@ Pass 1 uses thumbnails (about 480 px wide), which is enough for the
 embedding and for faces that fill a fair part of the frame. Small faces in
 group shots need the medium rendition; the index records the source of each
 result so a later pass can redo those. Movies are not indexed yet.
+
+## Shared libraries
+
+An iCloud Shared Photo Library is a second CloudKit zone. Its photographs are not
+in the user's own zone at all, so a tool that walks one zone is simply missing
+them. `photos sync` walks every zone the account can read and keeps a separate
+place in each, so one never re-walks because the other changed.
+
+```
+$ photos sync
+sync changes: 4,812 records; assets new 1,974, ...
+  SharedSync-7A4AECDE-...: shared library, 4,000 records, 1,974 new photos
+```
+
+Each photo records the zone that holds it, because a download has to be asked
+for in that zone; the indexer batches its downloads by zone for the same reason.
+A shared library that will not answer is reported and skipped: it must never cost
+someone their own library. `--no-shared` stays out of them entirely.
 
 ## Choosing a handful out of thousands
 

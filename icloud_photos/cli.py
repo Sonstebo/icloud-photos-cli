@@ -301,7 +301,7 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
     if (pid := _sync_pid(app)) is not None:
         raise CliError("sync-running", f"a sync is already running (pid {pid}); see `photos status`")
     if args.background:
-        flags = ["--full"] if args.full else []
+        flags = (["--full"] if args.full else []) + (["--no-shared"] if args.no_shared else [])
         app.emit(_spawn_worker("sync", ["sync", *flags], app.paths.sync_log, app.paths.sync_lock),
                  _started_text("sync"))
         return 0
@@ -311,12 +311,22 @@ def cmd_sync(app: App, args: argparse.Namespace) -> int:
             if not app.json and p["pages"] % 20 == 0:
                 print(f"  records {p['records']} assets new {p['new']} changed {p['changed']} "
                       f"relations {p['relations']} people {p['people']}", file=sys.stderr)
-        result = run_sync(app.catalog, app.adapter, full=args.full, progress=progress)
+        result = run_sync(app.catalog, app.adapter, full=args.full,
+                          shared=not args.no_shared, progress=progress)
     finally:
         app.paths.sync_lock.unlink(missing_ok=True)
-    app.emit(result, lambda r: f"sync {r['mode']}: {r['records']} records; assets new {r['new']}, changed {r['changed']}, "
-                               f"missing {r['missing']}; relations {r['relations']}, people {r['people']}, "
-                               f"face crops {r['face_crops']}, albums {r['albums']}")
+    def text(r: dict[str, Any]) -> str:
+        lines = [f"sync {r['mode']}: {r['records']} records; assets new {r['new']}, changed {r['changed']}, "
+                 f"missing {r['missing']}; relations {r['relations']}, people {r['people']}, "
+                 f"face crops {r['face_crops']}, albums {r['albums']}"]
+        for name, z in (r.get("zones") or {}).items():
+            if z.get("error"):
+                lines.append(f"  {name}: could not be read ({z['error']})")
+            elif z.get("shared"):
+                lines.append(f"  {name}: shared library, {z['records']} records, {z['new']} new photos")
+        return "\n".join(lines)
+
+    app.emit(result, text)
     return 0
 
 
@@ -1118,7 +1128,8 @@ def _fetch(app: App, asset: dict[str, Any], version: str, pin: bool = False) -> 
     cached = path is not None
     if path is None:
         try:
-            data = app.adapter.download(asset["id"], version, asset.get("master_id"))
+            data = app.adapter.download(asset["id"], version, asset.get("master_id"),
+                                        zone=asset.get("zone"))
         except NotLoggedIn as err:
             raise CliError("not-logged-in", f"{err}; run `photos login`", 3) from err
         if data is None:
@@ -1279,6 +1290,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    "Safe to interrupt: an interrupted run resumes where it stopped.")
     s.add_argument("--full", action="store_true", help="start from the beginning of the zone again")
     s.add_argument("--background", action="store_true", help="run detached; follow with `photos status`")
+    s.add_argument("--no-shared", action="store_true",
+                   help="skip shared libraries; by default every zone the account can read is walked")
     s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("albums", help="list albums known to the catalogue")

@@ -41,23 +41,65 @@ def _iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat() if dt else None
 
 
-def sync(catalog: Catalog, adapter: Adapter, *, full: bool = False, progress: Progress = _noop) -> dict[str, Any]:
-    token = None if full else catalog.get_meta("cursor")
+def _tokens(catalog: Catalog) -> dict[str, str | None]:
+    """Where each zone was left off. The old single `cursor` is the primary zone's."""
+    raw = catalog.get_meta("cursors")
+    if raw:
+        try:
+            return dict(json.loads(raw))
+        except ValueError:
+            pass
+    old = catalog.get_meta("cursor")
+    return {"": old} if old else {}
+
+
+def sync(catalog: Catalog, adapter: Adapter, *, full: bool = False, shared: bool = True,
+         progress: Progress = _noop) -> dict[str, Any]:
+    tokens = {} if full else _tokens(catalog)
+    try:
+        zones = adapter.zones()
+    except Exception:  # noqa: BLE001
+        zones = []
+    if not zones:                                    # an adapter that predates zones
+        zones = [None]
+    if not shared:
+        zones = [z for z in zones if z is None or not getattr(z, "shared", False)]
+
+    primary_token = tokens.get(zones[0].name if zones[0] is not None else "") or tokens.get("")
     result: dict[str, Any] = {
-        "started": now(), "mode": "full" if token is None else "changes", "pages": 0, "records": 0,
+        "started": now(), "mode": "full" if primary_token is None else "changes",
+        "pages": 0, "records": 0,
         "new": 0, "changed": 0, "same": 0, "missing": 0, "relations": 0, "people": 0, "face_crops": 0,
-        "tombstones": 0, "resumed": bool(token and catalog.get_meta("sync_progress")),
+        "tombstones": 0, "resumed": bool(primary_token and catalog.get_meta("sync_progress")),
+        "zones": {},
     }
-    for page, next_token in adapter.iter_zone(token):
-        catalog.db.execute("BEGIN")
-        for rec in page:
-            _apply(catalog, adapter, rec, result)
-        result["pages"] += 1
-        result["records"] += len(page)
-        catalog.set_meta("cursor", next_token)
-        catalog.set_meta("sync_progress", json.dumps(result))
-        catalog.db.execute("COMMIT")
-        progress(result)
+    for i, zone in enumerate(zones):
+        name = zone.name if zone is not None else ""
+        token = tokens.get(name) if not full else None
+        if token is None and i == 0 and not full:
+            # Catalogues written before zones kept one unnamed cursor, and it is
+            # the user's own library's. Without this the first sync after the
+            # upgrade walks all of it again.
+            token = tokens.get("")
+        before = dict(new=result["new"], records=result["records"])
+        try:
+            _walk(catalog, adapter, zone, token, tokens, result, progress, primary=(i == 0))
+        except Exception as err:  # noqa: BLE001
+            # The page loop opens a transaction per page; one that died mid-page
+            # has to be closed or nothing after it can start its own.
+            try:
+                catalog.db.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            if i == 0:
+                raise                                # the user's own library is not optional
+            # A shared library that will not answer must not cost the user their own.
+            result["zones"][name] = {"error": str(err)[:200]}
+            continue
+        result["zones"][name or "PrimarySync"] = {
+            "records": result["records"] - before["records"], "new": result["new"] - before["new"],
+            "shared": bool(zone is not None and getattr(zone, "shared", False)),
+        }
     albums = adapter.albums()
     catalog.replace_albums((a.id, a.name, a.fullname) for a in albums)
     result["albums"] = len(albums)
@@ -67,7 +109,27 @@ def sync(catalog: Catalog, adapter: Adapter, *, full: bool = False, progress: Pr
     return result
 
 
-def _apply(catalog: Catalog, adapter: Adapter, rec: RawRecord, result: dict[str, Any]) -> None:
+def _walk(catalog: Catalog, adapter: Adapter, zone: Any, token: str | None,
+          tokens: dict[str, str | None], result: dict[str, Any], progress: Progress,
+          primary: bool = True) -> None:
+    name = zone.name if zone is not None else ""
+    for page, next_token in adapter.iter_zone(token, zone) if zone is not None else adapter.iter_zone(token):
+        catalog.db.execute("BEGIN")
+        for rec in page:
+            _apply(catalog, adapter, rec, result, name or None)
+        result["pages"] += 1
+        result["records"] += len(page)
+        tokens[name] = next_token
+        catalog.set_meta("cursors", json.dumps(tokens))
+        if primary:
+            catalog.set_meta("cursor", next_token)   # the old key, for anything still reading it
+        catalog.set_meta("sync_progress", json.dumps(result))
+        catalog.db.execute("COMMIT")
+        progress(result)
+
+
+def _apply(catalog: Catalog, adapter: Adapter, rec: RawRecord, result: dict[str, Any],
+           zone: str | None = None) -> None:
     if rec.deleted:
         result["tombstones"] += 1
         known = catalog.get_record(rec.name)
@@ -94,10 +156,10 @@ def _apply(catalog: Catalog, adapter: Adapter, rec: RawRecord, result: dict[str,
     if rec.type == "CPLAsset":
         master = catalog.get_record(rec.master_ref) if rec.master_ref else None
         if master and master["json"] and not master["deleted"]:
-            _asset(catalog, adapter, rec, RawRecord(master["name"], "CPLMaster", False, None, master["json"]), result)
+            _asset(catalog, adapter, rec, RawRecord(master["name"], "CPLMaster", False, None, master["json"]), result, zone)
     elif rec.type == "CPLMaster":
         for asset in catalog.assets_of_master(rec.name):
-            _asset(catalog, adapter, RawRecord(asset["name"], "CPLAsset", False, None, asset["json"]), rec, result)
+            _asset(catalog, adapter, RawRecord(asset["name"], "CPLAsset", False, None, asset["json"]), rec, result, zone)
     elif rec.type == "CPLContainerRelation":
         catalog.set_relation(rec.value("containerId"), rec.value("itemId"), False)
         result["relations"] += 1
@@ -112,6 +174,7 @@ def _apply(catalog: Catalog, adapter: Adapter, rec: RawRecord, result: dict[str,
         result["face_crops"] += 1
 
 
-def _asset(catalog: Catalog, adapter: Adapter, asset: RawRecord, master: RawRecord, result: dict[str, Any]) -> None:
+def _asset(catalog: Catalog, adapter: Adapter, asset: RawRecord, master: RawRecord,
+           result: dict[str, Any], zone: str | None = None) -> None:
     info = adapter.asset_from_records(asset, master)
-    result[catalog.upsert_asset(info)] += 1
+    result[catalog.upsert_asset(info, zone=zone)] += 1

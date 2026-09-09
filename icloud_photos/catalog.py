@@ -163,6 +163,9 @@ class Catalog:
     # cannot add them, and a user's catalogue is not something to rebuild.
     LATER_COLUMNS = (
         ("faces", "cluster", "INTEGER"),
+        # Which CloudKit zone a photo came from. A shared library is a second
+        # zone, and a download has to be asked for in the zone that holds it.
+        ("assets", "zone", "TEXT"),
     )
 
     def _add_missing_columns(self) -> None:
@@ -203,7 +206,8 @@ class Catalog:
             self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
     # --- assets -----------------------------------------------------------
-    def upsert_asset(self, info: AssetInfo, seen: str | None = None) -> str:
+    def upsert_asset(self, info: AssetInfo, seen: str | None = None,
+                     zone: str | None = None) -> str:
         """Insert or update; returns 'new', 'changed' or 'same'."""
         seen = seen or now()
         fp = info.fingerprint()
@@ -214,24 +218,26 @@ class Catalog:
             status = "changed"
         else:
             status = "same"
-            self.db.execute("UPDATE assets SET last_seen=? WHERE id=?", (seen, info.id))
+            self.db.execute("UPDATE assets SET last_seen=?, zone=COALESCE(?, zone) WHERE id=?",
+                            (seen, zone, info.id))
             return status
         self.db.execute(
             """INSERT INTO assets (id, master_id, filename, kind, live, taken, added, width, height,
                    bytes, favorite, caption, latitude, longitude, hidden, versions, fingerprint,
-                   first_seen, last_seen, missing_since)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   first_seen, last_seen, missing_since, zone)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET master_id=excluded.master_id, filename=excluded.filename,
                    kind=excluded.kind, live=excluded.live, taken=excluded.taken, added=excluded.added,
                    width=excluded.width, height=excluded.height, bytes=excluded.bytes,
                    favorite=excluded.favorite, caption=excluded.caption, latitude=excluded.latitude,
                    longitude=excluded.longitude, hidden=excluded.hidden, versions=excluded.versions,
                    fingerprint=excluded.fingerprint, last_seen=excluded.last_seen,
+                   zone=COALESCE(excluded.zone, assets.zone),
                    missing_since=CASE WHEN excluded.missing_since IS NULL THEN NULL ELSE COALESCE(assets.missing_since, excluded.missing_since) END""",
             (info.id, info.master_id, info.filename, info.kind, int(info.live), iso(info.taken),
              iso(info.added), info.width, info.height, info.bytes, int(info.favorite), info.caption,
              info.latitude, info.longitude, int(info.hidden), json.dumps(info.versions), fp, seen, seen,
-             seen if info.deleted else None),
+             seen if info.deleted else None, zone),
         )
         return status
 

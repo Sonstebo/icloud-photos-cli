@@ -112,11 +112,19 @@ def index(catalog: Catalog, adapter: Adapter, cache: Cache, models: Models, *, l
         return images, need
 
     def download(need: list[dict[str, Any]]) -> list[tuple[str, bytes]]:
-        """Worker thread: network only, no catalogue access; one batch per rendition."""
+        """Worker thread: network only, no catalogue access; one batch per rendition.
+
+        Batched by zone as well: a shared library is a different zone, and a record
+        is only found in the one that holds it.
+        """
         out: list[tuple[str, bytes]] = []
-        for version in sorted({used[a["id"]] for a in need}):
-            items = [(a["id"], a["master_id"]) for a in need if used[a["id"]] == version]
-            out += [(asset_id, data) for asset_id, data in adapter.download_many(items, version) if data is not None]
+        for zone in sorted({a.get("zone") or "" for a in need}):
+            here = [a for a in need if (a.get("zone") or "") == zone]
+            for version in sorted({used[a["id"]] for a in here}):
+                items = [(a["id"], a["master_id"]) for a in here if used[a["id"]] == version]
+                out += [(asset_id, data) for asset_id, data
+                        in adapter.download_many(items, version, zone=zone or None)
+                        if data is not None]
         return out
 
     from concurrent.futures import ThreadPoolExecutor

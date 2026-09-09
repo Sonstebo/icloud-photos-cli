@@ -55,7 +55,7 @@ def tombstone(name: str) -> RawRecord:
 
 
 class FakeCloud:
-    """Pretends to be iCloud's photo zone.
+    """Pretends to be iCloud's photo zones.
 
     `library` holds AssetInfo objects; the zone feed presents each as a
     CPLMaster and a CPLAsset record (master first or asset first, both
@@ -69,6 +69,11 @@ class FakeCloud:
         self.pending: list[RawRecord] = []
         self.downloads: list[tuple[str, str]] = []
         self.album_list = [AlbumInfo("alb1", "Trip", "Trip"), AlbumInfo("alb2", "Family", "Folder/Family")]
+        # a shared library is a second zone; empty unless a test puts photos in one
+        self.shared_zones: list[str] = []
+        self.shared_pages: dict[str, list[RawRecord]] = {}
+        # photos that live only in a shared library, so `whole_zone` never sees them
+        self.shared_assets: dict[str, AssetInfo] = {}
         self.relations: list[tuple[str, str]] = []
         self.people: list[tuple[str, str, str]] = [("p1", "Thea-Oline", "Thea-Oline"), ("p2", "Ingjerd Thürmer", "Ingjerd")]
         self.face_crops: list[tuple[str, str]] = [("fc1", "p1"), ("fc2", "p1"), ("fc3", "p2")]
@@ -105,7 +110,7 @@ class FakeCloud:
     def auth_status(self):
         return {"authenticated": self.logged_in, "username": "fake@example.com"}
 
-    def iter_zone(self, since):
+    def _iter_primary(self, since):
         records = self.whole_zone() if since is None else self.pending
         if since is not None:
             self.pending = []
@@ -116,22 +121,36 @@ class FakeCloud:
             return
 
     def asset_from_records(self, asset, master):
-        info = self.assets[asset.name]
+        info = self.assets.get(asset.name) or self.shared_assets[asset.name]
         # what a real adapter would derive from the records rather than remember
         info.favorite = bool(asset.value("isFavorite"))
         return info
 
-    def download(self, asset_id, version, master_id=None):
-        a = self.assets.get(asset_id)
+    def zones(self):
+        from icloud_photos.adapter import ZoneInfo
+        return [ZoneInfo("PrimarySync")] + [ZoneInfo(n) for n in self.shared_zones]
+
+    def iter_zone(self, since, zone=None):
+        name = getattr(zone, "name", None)
+        if name and name != "PrimarySync":
+            # like the real feed: what is waiting, once, and then nothing
+            page = self.shared_pages.get(name, [])
+            self.shared_pages[name] = []
+            yield page, f"{name}-token"
+            return
+        yield from self._iter_primary(since)
+
+    def download(self, asset_id, version, master_id=None, zone=None):
+        a = self.assets.get(asset_id) or self.shared_assets.get(asset_id)
         assert master_id == a.master_id, "the CLI passes the catalogue's master id so no index walk is needed"
         if a is None or version not in a.versions:
             return None
         self.downloads.append((asset_id, version))
         return b"x" * a.versions[version]["bytes"]
 
-    def download_many(self, items, version, threads=4):
+    def download_many(self, items, version, threads=4, zone=None):
         for asset_id, master_id in items:
-            yield asset_id, self.download(asset_id, version, master_id)
+            yield asset_id, self.download(asset_id, version, master_id, zone)
 
     def download_face_crops(self, crop_ids, threads=4):
         for crop_id in crop_ids:
@@ -276,8 +295,8 @@ class CliTest(unittest.TestCase):
         class Boom(Exception):
             pass
         real = self.cloud.iter_zone
-        def flaky(since):
-            for n, page in enumerate(real(since)):
+        def flaky(since, zone=None):
+            for n, page in enumerate(real(since, zone)):
                 if n == 2:
                     raise Boom()
                 yield page
@@ -1545,3 +1564,98 @@ class ClusterTests(unittest.TestCase):
         who = dict(cat.db.execute("SELECT id, person_id FROM faces").fetchall())
         self.assertEqual((cleared, who[1], who[2]), (1, "julie", None))
         self.assertEqual(cat.db.execute("SELECT COUNT(*) FROM person_seeds").fetchone()[0], 0)
+
+
+class SharedLibraryTests(CliTest):
+    """A shared library is a second zone; a library that ignores it misses its photos."""
+
+    def add_shared(self, *numbers):
+        name = "SharedSync-TEST"
+        self.cloud.shared_zones = [name]
+        pages = []
+        for n in numbers:
+            asset = make_asset(n, filename=f"SHARED_{n:04d}.HEIC")
+            self.cloud.shared_assets[asset.id] = asset
+            pages += self.cloud.records_for(asset)
+        self.cloud.shared_pages[name] = pages
+        return name
+
+    def test_photos_in_a_shared_library_are_synced_and_remember_where_they_live(self):
+        name = self.add_shared(21, 22)
+        r, _ = self.j("sync")
+        self.assertIn(name, r["zones"])
+        self.assertTrue(r["zones"][name]["shared"])
+        self.assertEqual(r["zones"][name]["new"], 2)
+
+        found, _ = self.j("search", "SHARED_")
+        self.assertEqual(found["count"], 2)
+        zones = dict(self.j("search", "SHARED_")[0]["results"][0].items()).get("zone")
+        self.assertEqual(zones, name, "a photo must remember the zone that holds it")
+        own = self.j("search", "IMG_0001")[0]["results"][0]
+        self.assertEqual(own["zone"], "PrimarySync")
+
+    def test_each_zone_keeps_its_own_place_so_one_does_not_rewalk_the_other(self):
+        name = self.add_shared(21)
+        self.j("sync")
+        r, _ = self.j("sync")
+        self.assertEqual(r["records"], 0, "nothing changed anywhere")
+        # a new photo in the shared library alone
+        extra = make_asset(31, filename="SHARED_0031.HEIC")
+        self.cloud.shared_assets[extra.id] = extra
+        self.cloud.shared_pages[name] = self.cloud.records_for(extra)
+        r, _ = self.j("sync")
+        self.assertEqual(r["zones"][name]["new"], 1)
+
+    def test_no_shared_skips_them(self):
+        name = self.add_shared(21, 22)
+        r, _ = self.j("sync", "--no-shared")
+        self.assertNotIn(name, r["zones"])
+        self.assertEqual(self.j("search", "SHARED_")[0]["count"], 0)
+
+    def test_a_shared_library_that_will_not_answer_does_not_cost_the_user_their_own(self):
+        name = self.add_shared(21)
+
+        real = self.cloud.iter_zone
+
+        def refuse(since, zone=None):
+            if getattr(zone, "name", None) == name:
+                raise RuntimeError("shared zone is unavailable")
+            yield from real(since, zone)
+
+        self.cloud.iter_zone = refuse
+        r, _ = self.j("sync")
+        self.assertIn("unavailable", r["zones"][name]["error"])
+        self.assertGreater(r["new"], 0, "the user's own library still synced")
+        self.assertEqual(self.j("status", "--offline")[0]["catalog"]["assets"], 8)
+
+    def test_a_download_is_asked_for_in_the_zone_that_holds_the_photo(self):
+        name = self.add_shared(21)
+        self.j("sync")
+        asked = []
+        real = self.cloud.download
+
+        def note(asset_id, version, master_id=None, zone=None):
+            asked.append((asset_id, zone))
+            return real(asset_id, version, master_id, zone)
+
+        self.cloud.download = note
+        shared_id = next(a["id"] for a in self.j("search", "SHARED_")[0]["results"])
+        self.j("show", shared_id)
+        self.j("show", "A001/x+y==")
+        self.assertEqual(dict(asked)[shared_id], name)
+        self.assertEqual(dict(asked)["A001/x+y=="], "PrimarySync")
+
+    def test_a_catalogue_from_before_zones_does_not_rewalk_its_own_library(self):
+        self.j("sync")
+        # what an older version left behind: one unnamed cursor, no per-zone map
+        import sqlite3
+        db = next(Path(self.tmp.name).rglob("catalog.db"))
+        con = sqlite3.connect(db)
+        self.assertIsNotNone(con.execute("SELECT value FROM meta WHERE key='cursor'").fetchone(),
+                             "the old key must still be kept for catalogues that predate zones")
+        con.execute("DELETE FROM meta WHERE key='cursors'")
+        con.commit()
+        con.close()
+        r, _ = self.j("sync")
+        self.assertEqual(r["mode"], "changes", "an old cursor still means an incremental sync")
+        self.assertEqual(r["records"], 0, "and nothing is walked again")

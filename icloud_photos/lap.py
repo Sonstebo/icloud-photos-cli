@@ -326,7 +326,7 @@ def _fetch_thumb(a: dict[str, Any], adapter: Any, cache: Cache) -> Path | None:
     if version not in versions:
         return None
     try:
-        data = adapter.download(a["id"], version, a.get("master_id"))
+        data = adapter.download(a["id"], version, a.get("master_id"), zone=a.get("zone"))
     except Exception:  # noqa: BLE001 - one thumbnail is not worth ending the export
         return None
     if not data:
