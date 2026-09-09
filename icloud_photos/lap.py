@@ -44,6 +44,19 @@ ALBUM_NAME = "iCloud Photos"
 COMMIT_EVERY = 2000
 LAP_TABLES = ("albums", "afolders", "afiles", "athumbs", "persons", "faces", "acollections", "acollections_files")
 FORMAT_LABELS = {"JPEG": "JPG", "JPE": "JPG", "JFIF": "JPG", "TIF": "TIFF", "MPG": "MPEG", "M4V": "MP4"}
+# The app's own file types (t_utils.rs::get_file_type): 1 image, 2 video, 3 RAW. A RAW
+# labelled 1 is sent to the webview, which cannot decode it; it must be 3 so the app
+# decodes it with LibRaw. This mirrors t_common.rs::RAW_IMGS.
+RAW_SUFFIXES = {
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "rw2", "orf", "pef", "dng",
+    "srw", "rwl", "mrw", "3fr", "mos", "iiq", "dcr", "kdc", "erf", "mef", "raw", "mdc",
+}
+
+
+def file_type_of(name: str, kind: str) -> int:
+    if kind != "image":
+        return 2
+    return 3 if Path(name).suffix.lstrip(".").lower() in RAW_SUFFIXES else 1
 
 
 # The GUI's data directory, newest identifier first; a build may use any of them.
@@ -371,7 +384,7 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             target = cache.peek(a["id"], linked_version)
             name = f"{safe_name(a['id'])}@{stem}{suffix}"
             values = {
-                "size": int(a.get("bytes") or 0), "file_type": 1 if is_image else 2,
+                "size": int(a.get("bytes") or 0), "file_type": file_type_of(name, a.get("kind") or ""),
                 "format_label": format_label(name),
                 "created_at": taken, "modified_at": taken, "taken_date": taken,
                 "width": a.get("width"), "height": a.get("height"),
