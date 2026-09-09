@@ -791,7 +791,8 @@ def cmd_compose(app: App, args: argparse.Namespace) -> int:
     from . import compose as composer
 
     if args.id:
-        assets = _assets(app, args.id)
+        # ids or the paths of entries in the GUI album, so the app can pass what it has
+        assets = [_asset_for(app, i) for i in args.id]
         name = args.name or "selection"
     else:
         if not args.name:
@@ -1194,7 +1195,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    "on a table. No crop cuts a face when the catalogue knows where "
                                    "they are. Draft resolution unless --originals.")
     s.add_argument("name", nargs="?", help="a collection (see `photos collection list`)")
-    s.add_argument("--id", nargs="+", metavar="ID", help="compose these assets instead of a collection")
+    s.add_argument("--id", nargs="+", metavar="ID",
+                   help="compose these assets instead of a collection; ids or GUI album entry paths")
     s.add_argument("--template", default="justified",
                    choices=("justified", "grid", "hero", "filmstrip", "spread", "scatter"))
     s.add_argument("--shape", default="3:2",
