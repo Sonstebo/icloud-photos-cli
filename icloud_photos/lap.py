@@ -119,7 +119,7 @@ class LapLibrary:
         # autocommit mode: the export runs as one explicit transaction (BEGIN/COMMIT in `export`)
         self.db = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA busy_timeout=30000")
+        self.db.execute("PRAGMA busy_timeout=120000")   # the app may hold the write lock while it starts or stops
         self.db.execute("PRAGMA foreign_keys=ON")   # the app's tables cascade: deleting a file drops its thumbnail and faces
         self.db.execute("PRAGMA cache_size=-20000")  # 20 MB, not the default share of a 2 GB database
         # One export at a time: two would fight over the same write transaction.
@@ -169,6 +169,15 @@ class LapLibrary:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(albums)")}
         if "fetch_command" in cols:
             self.db.execute("UPDATE albums SET fetch_command=? WHERE id=?", (command, album_id))
+
+    def set_cli(self, album_id: int, cli: str) -> bool:
+        """The program that maintains this album, which the app asks for edits and
+        versions (its migration 19). A path, never a shell line."""
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(albums)")}
+        if "cli" not in cols:
+            return False
+        self.db.execute("UPDATE albums SET cli=? WHERE id=?", (cli, album_id))
+        return True
 
     def set_managed(self, album_id: int) -> bool:
         """Mark the album as maintained here (the app's migration 18). Without it the
@@ -338,13 +347,15 @@ def versions_of(a: dict[str, Any]) -> dict[str, Any]:
 
 
 def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None = None,
-           fetch_command: str | None = None, fetch_thumbs: bool = False, adapter: Any = None,
-           open_version: str = "original", progress: Progress = _noop) -> dict[str, Any]:
+           fetch_command: str | None = None, cli: str | None = None, fetch_thumbs: bool = False,
+           adapter: Any = None, open_version: str = "original", progress: Progress = _noop) -> dict[str, Any]:
     result: dict[str, Any] = {"library": str(lap.db_path), "root": str(lap.root), "open_version": open_version, "files": 0, "linked": 0,
                               "thumbs": 0, "embeddings": 0, "faces": 0, "people": 0, "collections": 0, "skipped": 0}
     album = lap.album_id()
     lap.set_fetch_command(album, fetch_command)
     result["managed"] = lap.set_managed(album)
+    if cli:
+        lap.set_cli(album, cli)
     root_folder = lap.folder_id(album, lap.root, True)
     folders: dict[str, int] = {}
     file_ids: dict[str, int] = {}

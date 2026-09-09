@@ -338,6 +338,7 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
     try:
         fetch = _lap_fetch_command(app)
         result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, fetch_command=fetch,
+                                   cli=_photos_binary(),
                                    fetch_thumbs=args.fetch_thumbs, adapter=app.adapter if args.fetch_thumbs else None,
                                    open_version=args.open_version or str(app.config.values.get("lap_open_version", "original")),
                                    progress=progress)
@@ -492,6 +493,7 @@ def cmd_refresh(app: App, args: argparse.Namespace) -> int:
         lib = lap_export.LapLibrary(library, app.paths.cache_dir / "lap")
         try:
             steps["gui"] = lap_export.export(app.catalog, app.cache, lib, fetch_command=_lap_fetch_command(app),
+                                         cli=_photos_binary(),
                                              open_version=str(app.config.values.get("lap_open_version", "original")))
         finally:
             lib.close()
@@ -499,9 +501,14 @@ def cmd_refresh(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
-def _lap_fetch_command(app: App) -> str:
+def _photos_binary() -> str:
+    """This program, as an absolute path when it has one: the app runs it directly."""
     photos_bin = Path(sys.executable).with_name("photos")
-    return f"{photos_bin if photos_bin.exists() else 'photos'} lap-fetch {{path}}"
+    return str(photos_bin) if photos_bin.exists() else "photos"
+
+
+def _lap_fetch_command(app: App) -> str:
+    return f"{_photos_binary()} lap-fetch {{path}}"
 
 
 def cmd_lap_fetch(app: App, args: argparse.Namespace) -> int:
