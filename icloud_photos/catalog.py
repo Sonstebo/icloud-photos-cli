@@ -154,9 +154,23 @@ class Catalog:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        self._add_missing_columns()
         if self.get_meta("schema") is None:
             self.set_meta("schema", str(SCHEMA_VERSION))
         self.vec = self._load_vec()
+
+    # Columns added after a catalogue was first created. CREATE TABLE IF NOT EXISTS
+    # cannot add them, and a user's catalogue is not something to rebuild.
+    LATER_COLUMNS = (
+        ("faces", "cluster", "INTEGER"),
+    )
+
+    def _add_missing_columns(self) -> None:
+        for table, column, decl in self.LATER_COLUMNS:
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self.db.execute("CREATE INDEX IF NOT EXISTS faces_cluster ON faces(cluster)")
 
     def _load_vec(self) -> bool:
         """sqlite-vec gives the catalogue nearest-neighbour search; without it, no semantic search."""

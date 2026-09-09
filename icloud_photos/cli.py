@@ -974,6 +974,117 @@ def cmd_book(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_faces_cluster(app: App, args: argparse.Namespace) -> int:
+    """Group faces that belong to the same person, so naming is done a group at a time."""
+    from . import cluster as clustering
+
+    result = clustering.build(app.catalog, threshold=args.threshold, min_size=args.min_size,
+                              progress=(lambda m: None) if app.json else
+                                       (lambda m: print(m, file=sys.stderr)))
+    app.emit(result, lambda r: (
+        f"{r['clusters']:,} groups over {r['grouped']:,} of {r['faces']:,} faces "
+        f"at {r['threshold']:.2f}; {r['loose']:,} stayed on their own"))
+    return 0
+
+
+def cmd_faces_groups(app: App, args: argparse.Namespace) -> int:
+    from . import cluster as clustering
+
+    named = True if args.named else (False if args.unnamed else None)
+    rows = [g.as_dict() for g in clustering.groups(
+        app.catalog, limit=args.limit, named=named, min_size=args.min_size)]
+    app.emit({"clusters": rows, "count": len(rows)}, lambda p: "\n".join(
+        f"{g['cluster']:>5}  {g['faces']:>5} faces  "
+        f"{(g['first_seen'] or '?')[:7]}..{(g['last_seen'] or '?')[:7]}  "
+        f"{g['person'] or '(no name yet)'}" for g in p["clusters"]) or "no groups; run `photos faces cluster`")
+    return 0
+
+
+def cmd_faces_name(app: App, args: argparse.Namespace) -> int:
+    from . import cluster as clustering
+
+    person = app.catalog.find_person(args.person)
+    if person is None:
+        raise CliError("unknown-person", f"no person {args.person!r}; see `photos people`")
+    try:
+        result = clustering.name(app.catalog, args.cluster, person["id"], seeds=args.seeds,
+                                 force=args.force)
+    except ValueError as err:
+        raise CliError("no-such-cluster", str(err)) from err
+    result["person"] = person["name"]
+    app.emit(result, lambda r: (
+        f"named {r['faces']} faces {r['person']!r} and seeded {r['seeds']} of them "
+        f"across {(r['first'] or '?')[:4]}..{(r['last'] or '?')[:4]}"
+        + (f"; {r['left_alone']} kept the name they had" if r["left_alone"] else "")
+        + "; run `photos index --rematch` to spread it"))
+    return 0
+
+
+def cmd_faces_unname(app: App, args: argparse.Namespace) -> int:
+    from . import cluster as clustering
+
+    n = clustering.unname(app.catalog, args.cluster)
+    app.emit({"cluster": args.cluster, "cleared": n},
+             lambda r: f"cleared {r['cleared']} faces in group {r['cluster']} (hand-made names kept)")
+    return 0
+
+
+def cmd_faces_crop(app: App, args: argparse.Namespace) -> int:
+    """Write a JPEG of each face, so an interface can show who it is asking about."""
+    import subprocess
+    from . import compose as composer
+    from .lap import rendition_dims
+
+    magick = shutil.which("magick")
+    if magick is None:
+        raise CliError("no-imagemagick", "ImageMagick 7 (`magick`) is not installed")
+    out_dir = Path(args.out).expanduser() if args.out else (app.paths.cache_dir / "faces")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for face_id in args.face_id:
+        face = app.catalog.get_face(face_id)
+        if face is None:
+            raise CliError("no-such-face", f"no face {face_id}")
+        asset = app.catalog.get_asset(face["asset_id"])
+        source = app.cache.peek(face["asset_id"], "medium") or app.cache.peek(face["asset_id"], "thumb")
+        if source is None:
+            results.append({"face_id": face_id, "asset_id": face["asset_id"], "path": None,
+                            "reason": "nothing cached for that photo yet"})
+            continue
+        # the box is in the pixels of whichever rendition the face pass analysed
+        sw, sh = rendition_dims(asset, face.get("source") or "thumb")
+        if not (sw and sh):
+            cached = app.cache.peek(face["asset_id"], face.get("source") or "thumb")
+            sw, sh = composer.image_size(cached) if cached else (None, None)
+        boxes = composer.normalise_faces([face["box"]], sw, sh)
+        fw, fh = composer.image_size(source)
+        if not boxes:
+            x, y, w, h = fw // 4, fh // 4, fw // 2, fh // 2      # no usable box: the middle
+        else:
+            x1, y1, x2, y2 = boxes[0]
+            pad = 0.35 * max(x2 - x1, y2 - y1)                   # room for hair and chin
+            x1, y1 = max(0.0, x1 - pad), max(0.0, y1 - pad)
+            x2, y2 = min(1.0, x2 + pad), min(1.0, y2 + pad)
+            x, y = int(x1 * fw), int(y1 * fh)
+            w, h = max(8, int((x2 - x1) * fw)), max(8, int((y2 - y1) * fh))
+        target = out_dir / f"face-{face_id}.jpg"
+        run = subprocess.run([magick, str(source), "-auto-orient",
+                              "-crop", f"{w}x{h}+{x}+{y}", "+repage",
+                              "-resize", f"{args.size}x{args.size}^",
+                              "-gravity", "center", "-extent", f"{args.size}x{args.size}",
+                              "-quality", "88", str(target)],
+                             capture_output=True, text=True, timeout=120)
+        if run.returncode != 0 or not target.exists():
+            results.append({"face_id": face_id, "asset_id": face["asset_id"], "path": None,
+                            "reason": (run.stderr or "").strip().splitlines()[-1:][0][:120] if run.stderr else "crop failed"})
+            continue
+        results.append({"face_id": face_id, "asset_id": face["asset_id"],
+                        "person": face.get("person_name"), "path": str(target)})
+    app.emit(results, lambda rs: "\n".join(
+        f"{r['face_id']}\t{r['path'] or '- ' + str(r.get('reason'))}" for r in rs))
+    return 0
+
+
 def _assets(app: App, ids: list[str]) -> list[dict[str, Any]]:
     out = []
     for asset_id in ids:
@@ -1253,6 +1364,33 @@ def build_parser() -> argparse.ArgumentParser:
     x = fs.add_parser("assign", help="name a face; it becomes a seed for that person")
     x.add_argument("face_id", type=int); x.add_argument("person", help="name, display name or id from `photos people`")
     x = fs.add_parser("unassign"); x.add_argument("face_id", type=int)
+    x = fs.add_parser("cluster", help="group faces that look like the same person")
+    x.add_argument("--threshold", type=float, default=0.62, metavar="COS",
+                   help="how alike two faces must be to be joined (default 0.62)")
+    x.add_argument("--min-size", type=int, default=2, metavar="N",
+                   help="ignore groups smaller than this (default 2)")
+    x.set_defaults(fn=cmd_faces_cluster)
+    x = fs.add_parser("groups", help="the groups, largest first")
+    x.add_argument("--limit", type=int, default=40, metavar="N")
+    x.add_argument("--min-size", type=int, default=2, metavar="N")
+    x.add_argument("--named", action="store_true", help="only groups that already have a name")
+    x.add_argument("--unnamed", action="store_true", help="only groups still without one")
+    x.set_defaults(fn=cmd_faces_groups)
+    x = fs.add_parser("name", help="name a whole group at once; its faces become seeds")
+    x.add_argument("cluster", type=int); x.add_argument("person")
+    x.add_argument("--seeds", type=int, default=12, metavar="N",
+                   help="how many faces to seed from, spread over the group's whole range")
+    x.add_argument("--force", action="store_true",
+                   help="also rename faces that already carry a different person")
+    x.set_defaults(fn=cmd_faces_name)
+    x = fs.add_parser("unname", help="undo naming a group; hand-made names are kept")
+    x.add_argument("cluster", type=int)
+    x.set_defaults(fn=cmd_faces_unname)
+    x = fs.add_parser("crop", help="write a JPEG of a face, for showing who is being asked about")
+    x.add_argument("face_id", nargs="+", type=int)
+    x.add_argument("--out", metavar="DIR", help="where to write them (default the cache)")
+    x.add_argument("--size", type=int, default=256, metavar="PX")
+    x.set_defaults(fn=cmd_faces_crop)
     x = fs.add_parser("unassigned", help="faces no person matched, most nearly matched first")
     x.add_argument("--limit", type=int, default=30); x.add_argument("--min-det", type=float, default=0.7)
     s.set_defaults(fn=cmd_faces)

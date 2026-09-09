@@ -1409,3 +1409,139 @@ class ScreenCaptureTests(CliTest):
         self.j("sync")
         r, _ = self.j("search")
         self.assertIn("IMG_0002.PNG", [a["filename"] for a in r["results"]])
+
+
+# --- grouping faces so naming is done a group at a time -----------------------
+
+class FakeFaceCatalog:
+    """A catalogue with just the tables the clustering touches."""
+
+    def __init__(self, faces):
+        import sqlite3
+        # autocommit, the way the real catalogue opens it, so BEGIN is ours to give
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            CREATE TABLE faces (id INTEGER PRIMARY KEY, asset_id TEXT, embedding BLOB,
+                                det REAL, person_id TEXT, similarity REAL, assigned TEXT,
+                                cluster INTEGER);
+            CREATE TABLE assets (id TEXT PRIMARY KEY, taken TEXT);
+            CREATE TABLE people (id TEXT PRIMARY KEY, name TEXT);
+            CREATE TABLE person_seeds (id TEXT PRIMARY KEY, person_id TEXT, embedding BLOB,
+                                       det REAL, origin TEXT);
+        """)
+        for fid, asset, taken, vec, person in faces:
+            self.db.execute("INSERT OR IGNORE INTO assets (id, taken) VALUES (?,?)", (asset, taken))
+            self.db.execute(
+                "INSERT INTO faces (id, asset_id, embedding, det, person_id, assigned) VALUES (?,?,?,?,?,?)",
+                (fid, asset, vec, 0.9, person, "auto" if person else None))
+            if person:
+                self.db.execute("INSERT OR IGNORE INTO people (id, name) VALUES (?,?)", (person, person))
+
+    def put_seed(self, seed_id, person_id, embedding, det, origin):
+        self.db.execute(
+            "INSERT OR REPLACE INTO person_seeds (id, person_id, embedding, det, origin) VALUES (?,?,?,?,?)",
+            (seed_id, person_id, embedding, det, origin))
+
+
+def fvec(*coords):
+    v = np.zeros(512, dtype=np.float32)
+    for i, c in enumerate(coords):
+        v[i] = c
+    return (v / float(np.linalg.norm(v))).astype(np.float32).tobytes()
+
+
+def chain_vec(step, total=1.0):
+    """A vector rotated `step` notches; neighbours are close, distant ones are not."""
+    import math
+    a = step * total
+    v = np.zeros(512, dtype=np.float32)
+    v[0], v[1] = math.cos(a), math.sin(a)
+    return v.tobytes()
+
+
+class ClusterTests(unittest.TestCase):
+    def setUp(self):
+        from icloud_photos import cluster
+        self.c = cluster
+
+    def test_a_chain_of_ages_becomes_one_group_though_its_ends_do_not_match(self):
+        # eight faces, each close to the next, the first and last far apart
+        faces = [(i + 1, f"A{i}", f"{2008 + i}-06-01T10:00:00", chain_vec(i, 0.28), None)
+                 for i in range(8)]
+        cat = FakeFaceCatalog(faces)
+        import numpy as _np
+        first = _np.frombuffer(faces[0][3], dtype=_np.float32)
+        last = _np.frombuffer(faces[-1][3], dtype=_np.float32)
+        self.assertLess(float(first @ last), 0.62, "the ends must not match directly")
+        got = self.c.build(cat, threshold=0.62)
+        self.assertEqual(got["clusters"], 1)
+        self.assertEqual(got["grouped"], 8)
+
+    def test_two_people_stay_apart(self):
+        faces = ([(i + 1, f"A{i}", "2020-01-01T10:00:00", fvec(1, 0.02 * i), None) for i in range(5)] +
+                 [(i + 10, f"B{i}", "2020-01-01T10:00:00", fvec(0, 1, 0.02 * i), None) for i in range(5)])
+        got = self.c.build(FakeFaceCatalog(faces), threshold=0.62)
+        self.assertEqual(got["clusters"], 2)
+
+    def test_a_lone_face_is_left_out_of_every_group(self):
+        faces = [(1, "A", "2020-01-01T10:00:00", fvec(1, 0), None),
+                 (2, "B", "2020-01-01T10:00:00", fvec(1, 0.01), None),
+                 (3, "C", "2020-01-01T10:00:00", fvec(0, 0, 1), None)]
+        got = self.c.build(FakeFaceCatalog(faces), threshold=0.62)
+        self.assertEqual((got["clusters"], got["grouped"], got["loose"]), (1, 2, 1))
+
+    def test_a_group_reports_the_person_most_of_its_named_faces_carry(self):
+        faces = [(i + 1, f"A{i}", f"{2010 + i}-05-01T10:00:00", fvec(1, 0.01 * i),
+                  "julie" if i < 4 else (None if i < 6 else "oline")) for i in range(7)]
+        cat = FakeFaceCatalog(faces)
+        self.c.build(cat, threshold=0.62)
+        g = self.c.groups(cat)[0]
+        self.assertEqual(g.person_id, "julie")
+        self.assertEqual(g.size, 7)
+        self.assertEqual((g.first[:4], g.last[:4]), ("2010", "2016"))
+
+    def test_naming_a_group_leaves_a_face_that_already_names_someone_else(self):
+        faces = [(1, "A", "2010-01-01T10:00:00", fvec(1, 0), None),
+                 (2, "B", "2014-01-01T10:00:00", fvec(1, 0.01), None),
+                 (3, "C", "2018-01-01T10:00:00", fvec(1, 0.02), "oline")]
+        cat = FakeFaceCatalog(faces)
+        self.c.build(cat, threshold=0.62)
+        got = self.c.name(cat, 1, "julie", seeds=4)
+        self.assertEqual((got["faces"], got["left_alone"]), (2, 1))
+        who = dict(cat.db.execute("SELECT id, person_id FROM faces").fetchall())
+        self.assertEqual(who[3], "oline", "a sister must not be renamed by resemblance")
+        self.assertEqual((who[1], who[2]), ("julie", "julie"))
+
+    def test_forcing_it_does_rename_them(self):
+        faces = [(1, "A", "2010-01-01T10:00:00", fvec(1, 0), None),
+                 (2, "B", "2018-01-01T10:00:00", fvec(1, 0.01), "oline")]
+        cat = FakeFaceCatalog(faces)
+        self.c.build(cat, threshold=0.62)
+        got = self.c.name(cat, 1, "julie", force=True)
+        self.assertEqual((got["faces"], got["left_alone"]), (2, 0))
+
+    def test_seeds_are_taken_across_the_whole_range_not_from_one_end(self):
+        faces = [(i + 1, f"A{i}", f"{2008 + i}-06-01T10:00:00", fvec(1, 0.005 * i), None)
+                 for i in range(16)]
+        cat = FakeFaceCatalog(faces)
+        self.c.build(cat, threshold=0.62)
+        self.c.name(cat, 1, "julie", seeds=4)
+        taken = [r[0] for r in cat.db.execute(
+            "SELECT a.taken FROM person_seeds s JOIN faces f ON ('cluster-1-' || f.id) = s.id "
+            "JOIN assets a ON a.id = f.asset_id ORDER BY a.taken")]
+        self.assertEqual(len(taken), 4)
+        self.assertLess(taken[0][:4], "2011")
+        self.assertGreater(taken[-1][:4], "2018")
+
+    def test_unnaming_undoes_the_group_but_not_a_hand_made_name(self):
+        faces = [(1, "A", "2010-01-01T10:00:00", fvec(1, 0), None),
+                 (2, "B", "2014-01-01T10:00:00", fvec(1, 0.01), None)]
+        cat = FakeFaceCatalog(faces)
+        self.c.build(cat, threshold=0.62)
+        self.c.name(cat, 1, "julie")
+        cat.db.execute("UPDATE faces SET assigned='manual' WHERE id=1")
+        cleared = self.c.unname(cat, 1)
+        who = dict(cat.db.execute("SELECT id, person_id FROM faces").fetchall())
+        self.assertEqual((cleared, who[1], who[2]), (1, "julie", None))
+        self.assertEqual(cat.db.execute("SELECT COUNT(*) FROM person_seeds").fetchone()[0], 0)

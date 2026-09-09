@@ -128,7 +128,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `edit ID PROMPT [--out DIR] [--timeout N]` | ask an agent to change a photo; the result is a new file on disk | yes |
 | `lap-export [--library P] [--root P] [--limit N] [--fetch-thumbs] [--open-version V]` | write the catalogue into the GUI's library | only with `--fetch-thumbs` |
 | `lap-fetch PATH` | fetch the file behind one GUI entry (the app's fetch-on-open command) | yes |
-| `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
+| `faces show\|assign\|unassign\|unassigned\|cluster\|groups\|name\|unname\|crop` | faces in photos; group them and name a whole group at once | no |
 | `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version`, `edits_dir`, `edit_agent`, `edit_timeout_s`, `collages_dir` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
@@ -338,6 +338,43 @@ underneath afterwards would make a captioned page taller than an uncaptioned one
 `export` without `--originals` gives a draft in seconds from cached thumbnails,
 at 150 dpi. With it, the originals are fetched and the PDF comes out at 300 dpi,
 A4 landscape measuring 842 by 595 points, which is A4.
+
+## Naming people the way a person would
+
+Comparing every face against a handful of reference faces cannot work over a
+childhood: a five-year-old does not resemble an eighteen-year-old closely enough
+to pass any threshold that is not also wrong about everyone else. That is why
+`photos index` alone leaves most faces unnamed.
+
+`photos faces cluster` fixes it without a new model. Faces are joined to their
+nearest neighbours and the joins are transitive: five resembles six, six
+resembles eight, eight resembles eleven, so the whole chain becomes one group
+even though its ends do not resemble each other at all.
+
+```
+$ photos faces cluster
+3,224 groups over 26,342 of 37,647 faces at 0.62; 11,305 stayed on their own
+
+$ photos faces groups --unnamed
+    6    789 faces  2002-11..2026-09  (no name yet)
+
+$ photos faces name 6 "Aud Brunes"
+$ photos index --rematch
+```
+
+Naming a group names its faces and seeds from a dozen of them **spread across the
+group's whole date range**, which is the entire point: seeds drawn from one end
+would leave the other end unrecognised all over again. A face that already
+carries a different name is left alone unless `--force`, because quietly renaming
+a sister because she resembles her sister is worse than leaving one face unnamed.
+`photos faces unname` undoes a group naming and never touches a hand-made one.
+
+Measured on a real 33,000-photo library: 37,647 faces grouped in 8.5 seconds, and
+one group held the same child from a baby photograph in 2008 to a portrait in
+2026. Naming it took that person from 2,258 photographs to 3,194.
+
+`photos faces crop` writes a JPEG of a face, which is how an interface shows you
+who it is asking about.
 
 ## Editing a photo by asking
 
