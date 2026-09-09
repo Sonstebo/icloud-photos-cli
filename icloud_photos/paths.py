@@ -71,6 +71,14 @@ class Paths:
         return self.data_dir / "models"
 
     @property
+    def edit_log(self) -> Path:
+        return self.state_dir / "edit.log"
+
+    @property
+    def edit_lock(self) -> Path:
+        return self.state_dir / "edit.lock"
+
+    @property
     def index_lock(self) -> Path:
         return self.state_dir / "index.lock"
 

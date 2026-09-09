@@ -22,7 +22,7 @@ from typing import Any, Callable
 from . import __version__
 from .adapter import Adapter, CloudError, ICloudAdapter, NotLoggedIn
 from .cache import BudgetExceeded, Cache
-from .catalog import Catalog
+from .catalog import Catalog, now as catalog_now
 from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
 from . import index as indexing
@@ -352,10 +352,10 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_edit(app: App, args: argparse.Namespace) -> int:
-    """Ask the agent to change one photo; the result is a new file on disk."""
-    target = Path(args.id)
-    if target.exists() or "@" in target.name:          # an entry in the GUI album
+def _asset_for(app: App, ident: str) -> dict[str, Any]:
+    """An asset from its id, or from the path of an entry in the GUI album."""
+    target = Path(ident)
+    if target.exists() or "@" in target.name:
         asset_id = lap_export.asset_id_of(target.name)
         row = app.catalog.db.execute("SELECT id FROM assets WHERE id=?", (asset_id,)).fetchone()
         if row is None:
@@ -363,25 +363,97 @@ def cmd_edit(app: App, args: argparse.Namespace) -> int:
                         if lap_export.safe_name(r["id"]) == asset_id), None)
         if row is None:
             raise CliError("no-such-asset", f"{target.name} names no asset in the catalogue")
-        asset = _assets(app, [row["id"]])[0]
+        return _assets(app, [row["id"]])[0]
+    return _assets(app, [ident])[0]
+
+
+def _run_edit(app: App, asset: dict[str, Any], prompt: str, parent: int | None, out: str | None,
+              timeout: int | None, quiet: bool) -> dict[str, Any]:
+    """Do one edit and record it as a version of the photo."""
+    if parent is not None:
+        source_row = app.catalog.variant(parent)
+        if source_row is None:
+            raise CliError("no-such-variant", f"there is no version {parent}")
+        if source_row["asset_id"] != asset["id"]:
+            raise CliError("no-such-variant", f"version {parent} belongs to another photo")
+        source, version = Path(source_row["path"]), f"variant:{parent}"
+        if not source.exists():
+            raise CliError("missing-variant", f"version {parent} is no longer on disk ({source})")
     else:
-        asset = _assets(app, [args.id])[0]
-    version = "original" if "original" in asset["versions"] else next(iter(asset["versions"]), "")
-    if not version:
-        raise CliError("no-such-version", f"{asset['id']} has no rendition to edit")
-    fetched = _fetch(app, asset, version)
+        version = "original" if "original" in asset["versions"] else next(iter(asset["versions"]), "")
+        if not version:
+            raise CliError("no-such-version", f"{asset['id']} has no rendition to edit")
+        source = Path(_fetch(app, asset, version)["path"])
     try:
-        result = editing.edit(Path(fetched["path"]), args.prompt,
+        result = editing.edit(source, prompt,
                               name=asset.get("filename") or asset["id"],
-                              root=Path(args.out) if args.out else editing.edits_dir(app.config.values.get("edits_dir")),
+                              root=Path(out) if out else editing.edits_dir(app.config.values.get("edits_dir")),
                               agent=str(app.config.values.get("edit_agent", editing.DEFAULT_AGENT)),
-                              timeout=args.timeout or int(app.config.values.get("edit_timeout_s", editing.DEFAULT_TIMEOUT)),
-                              progress=lambda m: None if app.json else print(f"  {m}", file=sys.stderr))
+                              timeout=timeout or int(app.config.values.get("edit_timeout_s", editing.DEFAULT_TIMEOUT)),
+                              progress=lambda m: None if quiet else print(f"  {m}", file=sys.stderr))
     except editing.EditFailed as err:
         raise CliError("edit-failed", str(err)) from err
-    app.emit({"id": asset["id"]} | result,
-             lambda r: f"{r['id']}\t{r['path']}\n  {r['method']}, {r['seconds']}s, {human_bytes(r['bytes'])}"
-                       + (f", {r['source_size']} -> {r['size']}" if r["size"] and r["size"] != r["source_size"] else ""))
+    w, h = (result["size"].split("x") + ["", ""])[:2] if result.get("size") else ("", "")
+    vid = app.catalog.add_variant(asset["id"], parent, result["path"], prompt, result.get("method"),
+                                  version, int(w) if w.isdigit() else None, int(h) if h.isdigit() else None,
+                                  result["bytes"])
+    return {"id": asset["id"], "variant": vid, "parent": parent} | result
+
+
+def cmd_edit(app: App, args: argparse.Namespace) -> int:
+    """Ask the agent to change one photo; the result is a new version on disk."""
+    asset = _asset_for(app, args.id)
+    if args.background:
+        job = app.catalog.add_job(asset["id"], args.frm, args.prompt)
+        info = _spawn_worker("edit", ["edit", "--job", str(job)], app.paths.edit_log, app.paths.edit_lock)
+        app.catalog.set_job(job, state="queued", pid=info.get("pid"))
+        app.emit({"job": job} | info, lambda p: f"edit queued as job {p['job']}; watch with `photos jobs`")
+        return 0
+    result = _run_edit(app, asset, args.prompt, args.frm, args.out, args.timeout, app.json)
+    app.emit(result, lambda r: f"{r['id']}\tversion {r['variant']}\t{r['path']}\n  {r['method']}, {r['seconds']}s, "
+                               f"{human_bytes(r['bytes'])}"
+                               + (f", {r['source_size']} -> {r['size']}" if r["size"] and r["size"] != r["source_size"] else ""))
+    return 0
+
+
+def cmd_edit_job(app: App, job_id: int) -> int:
+    """Run one queued edit. This is what the background worker does."""
+    job = app.catalog.job(job_id)
+    if job is None:
+        raise CliError("no-such-job", f"there is no job {job_id}")
+    app.catalog.set_job(job_id, state="running", started=catalog_now(), pid=os.getpid())
+    try:
+        result = _run_edit(app, _assets(app, [job["asset_id"]])[0], job["prompt"], job["parent"], None, None, True)
+    except CliError as err:
+        app.catalog.set_job(job_id, state="failed", error=str(err), finished=catalog_now())
+        raise
+    app.catalog.set_job(job_id, state="done", variant=result["variant"], finished=catalog_now())
+    app.emit({"job": job_id} | result, lambda r: f"job {r['job']} done: version {r['variant']} at {r['path']}")
+    return 0
+
+
+def cmd_variants(app: App, args: argparse.Namespace) -> int:
+    """Every version of a photo, and what was asked for each."""
+    asset = _asset_for(app, args.id)
+    rows = app.catalog.variants_of(asset["id"])
+    for r in rows:
+        r["exists"] = Path(r["path"]).exists()
+    app.emit({"id": asset["id"], "versions": rows, "count": len(rows)},
+             lambda p: "\n".join(f"{r['id']:>4}  {'from ' + str(r['parent']) if r['parent'] else 'from original':14s}  "
+                                 f"{r['method'] or '?':9s}  {r['prompt'][:48]:48s}  "
+                                 f"{'' if r['exists'] else '(file gone) '}{r['path']}" for r in p["versions"])
+                       or "no versions yet")
+    return 0
+
+
+def cmd_jobs(app: App, args: argparse.Namespace) -> int:
+    """Queued, running and finished edits."""
+    states = tuple(args.state) if args.state else ()
+    rows = app.catalog.jobs(states, limit=args.limit)
+    app.emit({"jobs": rows, "count": len(rows)},
+             lambda p: "\n".join(f"{r['id']:>4}  {r['state']:8s}  {r['asset_id'][:8]}  {r['prompt'][:44]:44s}  "
+                                 f"{('version ' + str(r['variant'])) if r['variant'] else (r['error'] or '')[:40]}"
+                                 for r in p["jobs"]) or "no edits yet")
     return 0
 
 
@@ -859,11 +931,28 @@ def build_parser() -> argparse.ArgumentParser:
                                    "folder; nothing is written to iCloud and the original is untouched. Ordinary "
                                    "photo work only: exposure, colour, crop, rotate, resize, borders, text. "
                                    "Inventing content needs an image model, which this does not use.")
-    s.add_argument("id", help="asset id, or the path of an entry in the GUI album")
-    s.add_argument("prompt", help="what to change, in plain words")
+    s.add_argument("id", nargs="?", help="asset id, or the path of an entry in the GUI album")
+    s.add_argument("prompt", nargs="?", help="what to change, in plain words")
+    s.add_argument("--from", dest="frm", type=int, metavar="VERSION",
+                   help="build on an earlier version of the photo instead of the original")
+    s.add_argument("--background", action="store_true", help="queue it and return at once; watch with `photos jobs`")
     s.add_argument("--out", help="where to put the result (config edits_dir, default ~/Pictures/Photos Edits)")
     s.add_argument("--timeout", type=int, help="seconds to allow the agent (config edit_timeout_s, default 900)")
-    s.set_defaults(fn=cmd_edit)
+    s.add_argument("--job", type=int, help=argparse.SUPPRESS)   # the background worker runs one queued job
+    s.set_defaults(fn=lambda app, a: cmd_edit_job(app, a.job) if a.job else cmd_edit(app, a))
+
+    s = sub.add_parser("versions", help="the edited versions of a photo",
+                       description="Every version made from a photo, oldest first, with the request that produced "
+                                   "each one. The original is untouched and stays in iCloud.")
+    s.add_argument("id", help="asset id, or the path of an entry in the GUI album")
+    s.set_defaults(fn=cmd_variants)
+
+    s = sub.add_parser("jobs", help="queued, running and finished edits",
+                       description="Edits queued with `edit --background`, newest first.")
+    s.add_argument("--state", action="append", choices=("queued", "running", "done", "failed"),
+                   help="only these states (repeatable)")
+    s.add_argument("--limit", type=int, default=20, help="how many to show (default 20)")
+    s.set_defaults(fn=cmd_jobs)
 
     s = sub.add_parser("refresh", help="sync, index what is new, and update the GUI library",
                        description="One pass of everything that keeps the library current: an incremental sync, an "

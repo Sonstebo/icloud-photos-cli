@@ -46,7 +46,9 @@ DEFAULT_TIMEOUT = 900
 
 INSTRUCTION = """You are editing one photograph, nothing else.
 
-The file is ./{input_name} in this directory, and it is attached so you can see it.
+The photograph is ./{input_name} in this directory, at its full resolution.
+./preview.jpg is the same picture as a JPEG, at most 2048 px: it is attached so you
+can see it, and it is the file to give an image tool, which cannot read HEIC or RAW.
 Apply exactly this change, and only this change:
 
 {prompt}
@@ -58,13 +60,14 @@ How to do it:
   original resolution, so prefer it whenever it can do the job.
 - If the change needs pixels that are not in the photo (removing or adding an
   object, restoring or repairing an old or damaged photo, changing a background),
-  use your image generation tool with ./{input_name} as the input image. Keep the
+  use your image generation tool with ./preview.jpg as the input image. Keep the
   same people, framing and proportions unless the request says otherwise.
 
 Rules:
 - Write the result as ./{output_name} in this directory (any common image format
   is fine; name it output.png if the tool returns PNG).
-- Never modify or delete ./{input_name}, and never touch anything outside this directory.
+- Never modify or delete ./{input_name} or ./preview.jpg, and never touch anything
+  outside this directory.
 - If you genuinely cannot do it, print `CANNOT: <one line why>` and write no file.
 - When the file is written, print two lines and nothing after them:
   `METHOD: magick` or `METHOD: generated`
@@ -129,12 +132,22 @@ def edit(source: Path, prompt: str, *, name: str | None = None, root: Path | Non
     suffix = source.suffix.lower() or ".jpg"
     input_name, output_name = f"input{suffix}", f"output{suffix}"
     shutil.copy2(source, work / input_name)
+    # A JPEG copy for the image tool and for the agent to look at: it cannot read
+    # HEIC or RAW, and a 24-megapixel upload would be slow for no gain.
+    preview = work / "preview.jpg"
+    magick = shutil.which("magick")
+    if magick is not None:
+        subprocess.run([magick, str(work / input_name), "-auto-orient", "-resize", "2048x2048>",
+                        "-quality", "92", str(preview)], capture_output=True, timeout=300)
+    if not preview.exists() and suffix in (".jpg", ".jpeg"):
+        shutil.copy2(source, preview)
+    attach = preview if preview.exists() else work / input_name
 
     started = time.time()
     progress(f"asking {agent} to edit {source.name}")
     try:
         run = subprocess.run(
-            [binary, "exec", "-C", str(work), "-i", str(work / input_name),
+            [binary, "exec", "-C", str(work), "-i", str(attach),
              "-s", "workspace-write", "--skip-git-repo-check",
              INSTRUCTION.format(input_name=input_name, output_name=output_name, prompt=prompt.strip())],
             capture_output=True, text=True, timeout=timeout, cwd=str(work))
@@ -149,7 +162,8 @@ def edit(source: Path, prompt: str, *, name: str | None = None, root: Path | Non
     produced = work / named if named and (work / named).exists() else work / output_name
     if not produced.exists():
         produced = next((p for p in sorted(work.iterdir())
-                         if p.name != input_name and p.is_file() and is_image(p)), None) or produced
+                         if p.name not in (input_name, preview.name) and p.is_file() and is_image(p)),
+                        None) or produced
     if said.startswith("CANNOT:") or not is_image(produced):
         detail = said or (tail[-1] if tail else (run.stderr or "").strip().splitlines()[-1:] or [""])[0]
         shutil.rmtree(work, ignore_errors=True)

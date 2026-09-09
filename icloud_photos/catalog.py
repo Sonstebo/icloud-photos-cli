@@ -74,6 +74,32 @@ CREATE TABLE IF NOT EXISTS collections (name TEXT PRIMARY KEY, created TEXT, not
 CREATE TABLE IF NOT EXISTS collection_assets (
     collection TEXT, asset_id TEXT, position INTEGER, note TEXT,
     PRIMARY KEY (collection, asset_id));
+
+-- Edited versions of a photo. The original stays in iCloud and is never touched;
+-- a variant is a local file made from the asset (parent NULL) or from another
+-- variant, with the request that produced it.
+CREATE TABLE IF NOT EXISTS variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL,
+    parent INTEGER,
+    path TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    method TEXT,
+    source_version TEXT,
+    width INTEGER, height INTEGER, bytes INTEGER,
+    created TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS variants_asset ON variants(asset_id);
+
+-- Queued edits, so the interface never waits on a two-minute generation.
+CREATE TABLE IF NOT EXISTS edit_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL,
+    parent INTEGER,
+    prompt TEXT NOT NULL,
+    state TEXT NOT NULL,
+    variant INTEGER, error TEXT, pid INTEGER,
+    created TEXT NOT NULL, started TEXT, finished TEXT);
+CREATE INDEX IF NOT EXISTS edit_jobs_state ON edit_jobs(state, id);
 """
 
 
@@ -571,6 +597,59 @@ class Catalog:
             removed += self.db.execute(
                 "DELETE FROM collection_assets WHERE collection=? AND asset_id=?", (name, asset_id)).rowcount
         return removed
+
+    # --- edited versions ------------------------------------------------------
+    def add_variant(self, asset_id: str, parent: int | None, path: str, prompt: str, method: str | None,
+                    source_version: str | None, width: int | None, height: int | None, bytes_: int) -> int:
+        cur = self.db.execute(
+            "INSERT INTO variants (asset_id, parent, path, prompt, method, source_version, width, height, bytes, created)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (asset_id, parent, path, prompt, method, source_version, width, height, bytes_, now()))
+        return int(cur.lastrowid)
+
+    def variants_of(self, asset_id: str) -> list[dict[str, Any]]:
+        """Every version of one photo, oldest first, each with what made it."""
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM variants WHERE asset_id=? ORDER BY id", (asset_id,))]
+
+    def variant(self, variant_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
+        return dict(row) if row else None
+
+    def variant_counts(self) -> dict[str, int]:
+        return {r["asset_id"]: r["n"] for r in self.db.execute(
+            "SELECT asset_id, COUNT(*) AS n FROM variants GROUP BY asset_id")}
+
+    def drop_variant(self, variant_id: int) -> int:
+        """Forget a version (children keep their own rows; the file is the caller's business)."""
+        return self.db.execute("DELETE FROM variants WHERE id=?", (variant_id,)).rowcount
+
+    # --- queued edits ---------------------------------------------------------
+    def add_job(self, asset_id: str, parent: int | None, prompt: str) -> int:
+        cur = self.db.execute(
+            "INSERT INTO edit_jobs (asset_id, parent, prompt, state, created) VALUES (?,?,?,'queued',?)",
+            (asset_id, parent, prompt, now()))
+        return int(cur.lastrowid)
+
+    def job(self, job_id: int) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM edit_jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def jobs(self, states: tuple[str, ...] = (), limit: int = 50) -> list[dict[str, Any]]:
+        q = "SELECT * FROM edit_jobs"
+        args: list[Any] = []
+        if states:
+            q += f" WHERE state IN ({','.join('?' * len(states))})"
+            args += list(states)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self.db.execute(q, args)]
+
+    def set_job(self, job_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        self.db.execute(f"UPDATE edit_jobs SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                        [*fields.values(), job_id])
 
     def collections(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute(
