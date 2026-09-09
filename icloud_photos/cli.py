@@ -749,6 +749,112 @@ def cmd_select(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def _compose_photo(app: App, asset: dict[str, Any], want_original: bool,
+                   fetched: list[str]) -> Any:
+    """Resolve one asset to a file on disk plus its face boxes, as the layout needs it."""
+    from . import compose as composer
+    from .lap import rendition_dims
+
+    order = ("original", "medium", "thumb") if want_original else ("original", "medium", "thumb")
+    path = None
+    if want_original:
+        path = app.cache.peek(asset["id"], "original")
+        if path is None:
+            path = Path(_fetch(app, asset, "original")["path"])
+            fetched.append(asset["id"])
+    if path is None:
+        for version in order:
+            path = app.cache.peek(asset["id"], version)
+            if path is not None:
+                break
+    if path is None:
+        # nothing cached and no original asked for: a medium is the cheap way in
+        path = Path(_fetch(app, asset, "medium")["path"])
+        fetched.append(asset["id"])
+
+    width, height = composer.image_size(path)
+    faces = app.catalog.faces_of(asset["id"])
+    boxes: list[Any] = []
+    if faces:
+        source = faces[0].get("source") or "thumb"
+        sw, sh = rendition_dims(asset, source)
+        if not (sw and sh):
+            cached = app.cache.peek(asset["id"], source)
+            if cached is not None:
+                sw, sh = composer.image_size(cached)
+        boxes = composer.normalise_faces([f["box"] for f in faces], sw, sh)
+    return composer.Photo(asset["id"], path, width, height, boxes)
+
+
+def cmd_compose(app: App, args: argparse.Namespace) -> int:
+    """Turn a set of photos into one picture."""
+    from . import compose as composer
+
+    if args.id:
+        assets = _assets(app, args.id)
+        name = args.name or "selection"
+    else:
+        if not args.name:
+            raise CliError("nothing-to-compose", "name a collection, or give --id ID...")
+        if not app.catalog.collection_exists(args.name):
+            raise CliError("unknown-collection",
+                           f"no collection {args.name!r}; see `photos collection list`")
+        assets = app.catalog.collection_items(args.name)
+        name = args.name
+    assets = [a for a in assets if a["kind"] == "image"]
+    if args.count:
+        assets = assets[:args.count]
+    if not assets:
+        raise CliError("nothing-to-compose", "no photos in that set (movies are not composed)")
+
+    if args.originals:
+        # Say what it costs before reaching for the network, and never quietly
+        # overrun the cache budget for a collage.
+        missing = [a for a in assets if app.cache.peek(a["id"], "original") is None]
+        need = sum(int(a.get("bytes") or 0) for a in missing)
+        usage = app.cache.usage()
+        if need and usage["bytes"] + need > usage["budget_bytes"]:
+            raise CliError("cache-full",
+                           f"{len(missing)} originals would need {human_bytes(need)} and the cache "
+                           f"budget has {human_bytes(max(0, usage['budget_bytes'] - usage['bytes']))} "
+                           "left; raise cache_budget_mb or evict first", 4)
+
+    fetched: list[str] = []
+    photos = [_compose_photo(app, a, args.originals, fetched) for a in assets]
+
+    if args.plan:
+        payload = composer.plan(photos, template=args.template, shape=args.shape,
+                                gap=args.gap, long_edge=args.long_edge, face_safe=not args.no_face_safe)
+        payload["fetched"] = len(fetched)
+        app.emit(payload, lambda pl: "\n".join(
+            [f"{pl['template']} on {pl['width']}x{pl['height']} ({pl['note']})"] +
+            [f"  {s['id'][:8]}  {s['w']:>5}x{s['h']:<5} at +{s['x']}+{s['y']}"
+             f"  crop {s['crop']['w']}x{s['crop']['h']}+{s['crop']['x']}+{s['crop']['y']}"
+             for s in pl["slots"]]))
+        return 0
+
+    root = Path(str(app.config.values.get("collages_dir") or composer.DEFAULT_DIR))
+    out = Path(args.out) if args.out else composer.output_path(root, name, args.template, args.shape)
+    long_edge = args.long_edge or (None if args.originals else composer.DRAFT_LONG_EDGE)
+    try:
+        result = composer.render(
+            photos, out, template=args.template, shape=args.shape, gap=args.gap,
+            long_edge=long_edge, face_safe=not args.no_face_safe, background=args.background,
+            progress=(lambda m: None) if app.json else (lambda m: print(m, file=sys.stderr)))
+    except composer.ComposeFailed as err:
+        raise CliError("compose-failed", str(err)) from err
+
+    result["collection"] = name
+    result["fetched"] = len(fetched)
+    result["faces_used"] = sum(1 for p in photos if p.faces)
+    app.emit(result, lambda r: (
+        f"{r['path']}\n{r['template']} - {r['photos']} photos on {r['width']}x{r['height']} "
+        f"({r['note']}), {human_bytes(r['bytes'])} in {r['seconds']}s"
+        + (f"; fetched {r['fetched']} originals" if r["fetched"] else "")
+        + ("; draft resolution, use --originals to print it" if r["draft"] else "")))
+    return 0
+
+
 def _assets(app: App, ids: list[str]) -> list[dict[str, Any]]:
     out = []
     for asset_id in ids:
@@ -1079,6 +1185,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--into", metavar="COLLECTION", help="add the chosen photos to this collection, in order")
     s.add_argument("--replace", action="store_true", help="with --into, empty the collection first")
     s.set_defaults(fn=cmd_select)
+
+    s = sub.add_parser("compose", help="turn a set of photos into one picture",
+                       description="Templates: justified fills the page with rows that each span "
+                                   "the full width; grid uses uniform cells; hero makes the first "
+                                   "photo large; filmstrip runs equal frames across the page; "
+                                   "spread lays out two facing pages; scatter drops mounted prints "
+                                   "on a table. No crop cuts a face when the catalogue knows where "
+                                   "they are. Draft resolution unless --originals.")
+    s.add_argument("name", nargs="?", help="a collection (see `photos collection list`)")
+    s.add_argument("--id", nargs="+", metavar="ID", help="compose these assets instead of a collection")
+    s.add_argument("--template", default="justified",
+                   choices=("justified", "grid", "hero", "filmstrip", "spread", "scatter"))
+    s.add_argument("--shape", default="3:2",
+                   choices=("3:2", "square", "a4-landscape", "a4-portrait", "spread", "16:9"))
+    s.add_argument("--gap", type=int, default=8, metavar="N", help="space between photos (default 8)")
+    s.add_argument("--count", type=int, metavar="N", help="use only the first N of the set")
+    s.add_argument("--background", default="white", metavar="COLOUR")
+    s.add_argument("--long-edge", type=int, metavar="PX", help="override the page's pixel size")
+    s.add_argument("--originals", action="store_true",
+                   help="fetch full-resolution originals and compose at print size")
+    s.add_argument("--no-face-safe", action="store_true",
+                   help="crop from the centre even when it cuts a face")
+    s.add_argument("--plan", action="store_true", help="print the geometry; write no file")
+    s.add_argument("--out", metavar="FILE", help="write here instead of the dated folder")
+    s.set_defaults(fn=cmd_compose)
 
     s = sub.add_parser("info", help="everything known about one or more assets")
     s.add_argument("id", nargs="+")

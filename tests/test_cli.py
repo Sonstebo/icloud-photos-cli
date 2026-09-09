@@ -994,3 +994,234 @@ class SelectCliTests(CliTest):
         self.assertEqual(r["stages"][1]["kept"], 1)          # A003 is the only favourite
         self.assertEqual(r["count"], 1)
         self.assertIn("only 1 photos survived", r["reason"])
+
+
+# --- turning a set of photos into one picture --------------------------------
+
+def cphoto(pid, w, h, faces=()):
+    from icloud_photos import compose
+    return compose.Photo(pid, Path("/nowhere.jpg"), w, h, list(faces))
+
+
+class ComposeGeometryTests(unittest.TestCase):
+    """The layout and the crop, with no files and no ImageMagick."""
+
+    def setUp(self):
+        from icloud_photos import compose
+        self.c = compose
+        # a realistic mix: portrait, square, landscape and a panorama
+        self.photos = [cphoto("p1", 2000, 3008), cphoto("p2", 4032, 3024),
+                       cphoto("p3", 4096, 4096), cphoto("p4", 3024, 4032),
+                       cphoto("p5", 6000, 3376), cphoto("p6", 4032, 3024),
+                       cphoto("p7", 2480, 3508), cphoto("p8", 3840, 2160),
+                       cphoto("p9", 15336, 3876)]
+
+    def inside(self, slots, W, H):
+        return [s for s in slots
+                if s.x < -1 or s.y < -1 or s.x + s.w > W + 1 or s.y + s.h > H + 1]
+
+    def test_justified_fills_the_page_and_keeps_every_slot_on_it(self):
+        for n in range(1, 10):
+            with self.subTest(photos=n):
+                slots = self.c.justified(self.photos[:n], 1400.0, 933.0, 8.0)
+                self.assertEqual(len(slots), n)
+                self.assertEqual(self.inside(slots, 1400.0, 933.0), [])
+                covered = sum(s.w * s.h for s in slots) / (1400.0 * 933.0)
+                self.assertGreater(covered, 0.90, "a justified page should not be mostly empty")
+
+    def test_justified_never_stretches_a_photograph(self):
+        slots = self.c.justified(self.photos, 1400.0, 933.0, 0.0)
+        for s in slots:
+            # each row scales heights, so a slot is a crop of the photo, never a stretch
+            self.assertGreater(s.w, 0)
+            self.assertGreater(s.h, 0)
+        rows = {}
+        for s in slots:
+            rows.setdefault(round(s.y), []).append(s)
+        for row in rows.values():
+            self.assertAlmostEqual(sum(s.w for s in row), 1400.0, delta=1.5)
+
+    def test_a_grid_of_nine_is_three_by_three_not_four_by_three(self):
+        slots = self.c.grid(self.photos[:9], 1500.0, 1000.0, 0.0)
+        xs = sorted({round(s.x) for s in slots})
+        ys = sorted({round(s.y) for s in slots})
+        self.assertEqual((len(xs), len(ys)), (3, 3))
+
+    def test_a_short_last_row_is_centred_rather_than_left_hanging(self):
+        slots = self.c.grid(self.photos[:8], 1500.0, 1000.0, 0.0)
+        last = [s for s in slots if round(s.y) == max(round(x.y) for x in slots)]
+        left = min(s.x for s in last)
+        right = 1500.0 - max(s.x + s.w for s in last)
+        self.assertAlmostEqual(left, right, delta=1.0)
+
+    def test_a_filmstrip_fills_the_page_instead_of_floating_in_it(self):
+        slots = self.c.filmstrip(self.photos[:6], 1400.0, 933.0, 6.0)
+        self.assertEqual(len({round(s.w) for s in slots}), 1)      # equal frames
+        self.assertTrue(all(abs(s.h - 933.0) < 1 for s in slots))
+        self.assertEqual(self.inside(slots, 1400.0, 933.0), [])
+
+    def test_a_spread_leaves_a_gutter_that_nothing_crosses(self):
+        W, H = 1600.0, 1100.0
+        slots = self.c.spread(self.photos[:8], W, H, 6.0)
+        gutter = max(6.0 * 2.6, W * 0.035)
+        page = (W - gutter) / 2.0
+        for s in slots:
+            crosses = s.x < page and s.x + s.w > page + gutter
+            self.assertFalse(crosses, "no photo may sit in the gutter")
+
+    def test_scatter_keeps_every_print_on_the_page_and_repeats_exactly(self):
+        a = self.c.scatter(self.photos, 1400.0, 933.0, 8.0)
+        b = self.c.scatter(self.photos, 1400.0, 933.0, 8.0)
+        self.assertEqual([s.as_dict() for s in a], [s.as_dict() for s in b])
+        self.assertEqual(self.inside(a, 1400.0, 933.0), [])
+        self.assertTrue(all(s.mount > 0 for s in a))
+
+    def test_every_template_survives_a_single_photograph(self):
+        for name, fn in self.c.TEMPLATES.items():
+            with self.subTest(template=name):
+                slots = fn(self.photos[:1], 1000.0, 1000.0, 8.0)
+                self.assertEqual(len(slots), 1)
+                self.assertEqual(self.inside(slots, 1000.0, 1000.0), [])
+
+
+class CropTests(unittest.TestCase):
+    def setUp(self):
+        from icloud_photos import compose
+        self.c = compose
+
+    def test_with_no_faces_the_crop_is_centred(self):
+        p = cphoto("p", 4000, 2000)
+        w, h, x, y = self.c.crop_box(p, 1.0)
+        self.assertEqual((w, h), (2000, 2000))
+        self.assertEqual((x, y), (1000, 0))                 # centred on a 4000 wide frame
+
+    def test_a_square_slot_slides_sideways_to_keep_a_face_whole(self):
+        # the face sits far to the right; a centred crop would cut it
+        p = cphoto("p", 4000, 2000, [(0.80, 0.30, 0.95, 0.70)])
+        w, h, x, y = self.c.crop_box(p, 1.0, face_safe=True)
+        self.assertEqual((w, h), (2000, 2000))
+        self.assertGreaterEqual(x + w, 0.95 * 4000)         # the whole face is inside
+        self.assertLessEqual(x, 0.80 * 4000)
+        centred = self.c.crop_box(p, 1.0, face_safe=False)[2]
+        self.assertGreater(x, centred, "face-safe should have moved the window right")
+
+    def test_a_tall_photo_slides_up_or_down_to_keep_a_face_whole(self):
+        p = cphoto("p", 2000, 4000, [(0.3, 0.05, 0.7, 0.20)])
+        w, h, x, y = self.c.crop_box(p, 1.0, face_safe=True)
+        self.assertEqual((w, h), (2000, 2000))
+        self.assertLessEqual(y, 0.05 * 4000)
+        self.assertGreaterEqual(y + h, 0.20 * 4000)
+
+    def test_turning_face_safety_off_always_centres(self):
+        p = cphoto("p", 4000, 2000, [(0.80, 0.30, 0.95, 0.70)])
+        self.assertEqual(self.c.crop_box(p, 1.0, face_safe=False)[2], 1000)
+
+    def test_a_matching_shape_is_not_cropped_at_all(self):
+        p = cphoto("p", 3000, 2000)
+        self.assertEqual(self.c.crop_box(p, 1.5), (3000, 2000, 0, 0))
+
+    def test_faces_that_do_not_fit_the_rendition_are_refused_not_guessed(self):
+        good = self.c.normalise_faces([[100, 50, 200, 180]], 400, 300)
+        self.assertEqual(len(good), 1)
+        self.assertAlmostEqual(good[0][0], 0.25)
+        # a box beyond the frame means the rendition size is wrong; a bad crop is
+        # worse than a centred one, so all of them are dropped
+        self.assertEqual(self.c.normalise_faces([[100, 50, 900, 180]], 400, 300), [])
+        self.assertEqual(self.c.normalise_faces([[1, 2, 3, 4]], None, None), [])
+
+
+class ComposePlanTests(unittest.TestCase):
+    def setUp(self):
+        from icloud_photos import compose
+        self.c = compose
+
+    def test_the_plan_reports_the_page_and_a_crop_for_every_photo(self):
+        photos = [cphoto(f"p{i}", 4032, 3024) for i in range(6)]
+        got = self.c.plan(photos, template="justified", shape="a4-landscape")
+        self.assertEqual((got["width"], got["height"]), (3508, 2480))
+        self.assertFalse(got["draft"])
+        self.assertEqual(len(got["slots"]), 6)
+        self.assertTrue(all("crop" in s for s in got["slots"]))
+
+    def test_a_smaller_page_is_marked_as_a_draft_and_says_the_print_size(self):
+        got = self.c.plan([cphoto("p", 4032, 3024)], shape="3:2", long_edge=1800)
+        self.assertTrue(got["draft"])
+        self.assertEqual(got["print_size"], [5400, 3600])
+        self.assertIn("5400x3600", got["note"])
+
+    def test_an_unknown_template_or_shape_says_what_there_is(self):
+        with self.assertRaises(self.c.ComposeFailed) as e:
+            self.c.plan([cphoto("p", 10, 10)], template="mosaic")
+        self.assertIn("justified", str(e.exception))
+        with self.assertRaises(self.c.ComposeFailed):
+            self.c.plan([cphoto("p", 10, 10)], shape="A3")
+        with self.assertRaises(self.c.ComposeFailed):
+            self.c.plan([], template="grid")
+
+    def test_the_output_name_never_overwrites_and_carries_no_colon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.c.output_path(root, "Summer 2024!", "justified", "3:2")
+            self.assertNotIn(":", first.name)
+            self.assertEqual(first.name, "summer-2024-justified-3-2.jpg")
+            first.parent.mkdir(parents=True, exist_ok=True)
+            first.write_bytes(b"x")
+            second = self.c.output_path(root, "Summer 2024!", "justified", "3:2")
+            self.assertNotEqual(first, second)
+
+
+@unittest.skipUnless(__import__("shutil").which("magick"), "ImageMagick is not installed")
+class ComposeRenderTests(unittest.TestCase):
+    """The one path that actually draws pixels."""
+
+    def setUp(self):
+        from icloud_photos import compose
+        self.c = compose
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.photos = []
+        for i, (w, h) in enumerate([(400, 300), (300, 400), (400, 400), (600, 200), (500, 375)]):
+            f = self.dir / f"src{i}.jpg"
+            subprocess.run(["magick", "-size", f"{w}x{h}",
+                            f"gradient:#{i}{i}0000-#00{i}{i}00", str(f)], check=True)
+            self.photos.append(self.c.Photo(f"p{i}", f, w, h, []))
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_page_is_drawn_at_the_size_asked_for(self):
+        out = self.dir / "page.jpg"
+        got = self.c.render(self.photos, out, template="justified", shape="3:2", long_edge=600)
+        self.assertTrue(out.exists())
+        self.assertGreater(got["bytes"], 0)
+        size = subprocess.run(["magick", "identify", "-format", "%wx%h", str(out)],
+                              capture_output=True, text=True).stdout
+        self.assertEqual(size, f"{got['width']}x{got['height']}")
+
+    def test_every_template_draws_something(self):
+        for name in self.c.TEMPLATES:
+            with self.subTest(template=name):
+                out = self.dir / f"{name}.jpg"
+                self.c.render(self.photos, out, template=name, shape="square", long_edge=400)
+                self.assertGreater(out.stat().st_size, 0)
+
+    def test_the_same_recipe_twice_gives_the_same_picture(self):
+        a, b = self.dir / "a.png", self.dir / "b.png"
+        self.c.render(self.photos, a, template="scatter", shape="3:2", long_edge=500)
+        self.c.render(self.photos, b, template="scatter", shape="3:2", long_edge=500)
+        self.assertEqual(a.read_bytes(), b.read_bytes())
+
+    def test_a_missing_source_is_reported_not_a_blank_page(self):
+        gone = [self.c.Photo("x", self.dir / "not-here.jpg", 100, 100, [])]
+        with self.assertRaises(self.c.ComposeFailed):
+            self.c.render(gone, self.dir / "bad.jpg", long_edge=300)
+
+
+class ComposeCliTests(CliTest):
+    def test_compose_refuses_a_set_it_cannot_use_and_says_why(self):
+        self.j("sync")
+        _, err = self.j("compose", "Nope", expect=1)
+        self.assertIn("unknown-collection", err)
+        _, err = self.j("compose", expect=1)
+        self.assertIn("nothing-to-compose", err)
+        # a movie is not composed, and saying so beats drawing an empty page
+        _, err = self.j("compose", "--id", "A009/x+y==", expect=1)
+        self.assertIn("nothing-to-compose", err)

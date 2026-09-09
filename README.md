@@ -115,6 +115,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `albums` | albums in the catalogue with counts | no |
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `select [QUERY] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
+| `compose [COLLECTION] [--id ID...] [--template justified\|grid\|hero\|filmstrip\|spread\|scatter] [--shape 3:2\|square\|a4-landscape\|a4-portrait\|spread\|16:9] [--gap N] [--count N] [--background C] [--long-edge PX] [--originals] [--no-face-safe] [--plan] [--out FILE]` | turn a set of photos into one picture; no crop cuts a face | only with `--originals` |
 | `info ID...` | every field, cached renditions, albums, collections | no |
 | `show ID... [--size thumb\|medium]` | fetch previews, print `id<TAB>path` | if not cached |
 | `original ID... [--pin] [--version V]` | fetch full files, print paths | if not cached |
@@ -127,7 +128,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `lap-export [--library P] [--root P] [--limit N] [--fetch-thumbs] [--open-version V]` | write the catalogue into the GUI's library | only with `--fetch-thumbs` |
 | `lap-fetch PATH` | fetch the file behind one GUI entry (the app's fetch-on-open command) | yes |
 | `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
-| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version`, `edits_dir`, `edit_agent`, `edit_timeout_s` | no |
+| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version`, `edits_dir`, `edit_agent`, `edit_timeout_s`, `collages_dir` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
 includes the whole of the period given. Exit codes: 1 error, 2 needs a
@@ -257,6 +258,43 @@ except that anything you marked as a favourite outranks any measurement.
 guarantees each of them appears at least once, reporting anyone it could not
 place rather than quietly leaving them out. Nothing here touches the network,
 and `--into` writes the result to a collection in order.
+
+## Turning a set of photos into one picture
+
+`photos compose` lays a collection out as a collage, a book spread, a contact
+strip or a scatter of mounted prints. Geometry is code, not conversation: the
+same photos and the same recipe always give the same picture, so a draft on
+screen and the file that goes to the printer are the same layout.
+
+```
+$ photos select "the winter trip" --count 9 --spread day --into "Winter book"
+$ photos compose "Winter book" --template justified          # a draft, seconds, no network
+$ photos compose "Winter book" --template justified --originals   # the same page at 300 dpi
+```
+
+Composing is fast because it uses whatever is already cached, at draft size.
+Only `--originals` reaches for the full files, and it refuses to start if they
+would not fit the cache budget rather than overrunning it.
+
+**No crop cuts a face.** Every slot has its own shape and almost no photo
+matches it, so something must be cropped away; cropping from the centre
+eventually slices somebody's head in half. The catalogue already knows where the
+faces are, so the crop window slides just far enough to hold them all. If the
+stored boxes cannot be trusted for a photo, its faces are ignored and the crop is
+centred, because a wrong crop is worse than a plain one. `--no-face-safe` turns
+it off.
+
+The templates: **justified** fills the page with rows that each span the full
+width, choosing the row count whose natural height lands closest to the page;
+**grid** uses uniform cells and centres a short last row; **hero** makes the
+first photo large; **filmstrip** runs equal frames across the whole page;
+**spread** lays out two facing pages and lets nothing cross the gutter;
+**scatter** drops mounted prints on a table with a fixed, repeatable tilt.
+No photograph is ever stretched, only cropped.
+
+`--plan` prints the geometry and writes no file, which is what a preview draws.
+Results land in `~/Pictures/Photos Collages/<date>/`, an ordinary folder
+(`collages_dir`).
 
 ## Editing a photo by asking
 

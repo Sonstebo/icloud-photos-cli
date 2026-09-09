@@ -20,6 +20,12 @@ DEFAULTS = {
     "face_threshold": 0.5,     # cosine similarity for naming a face from a person's seeds
     "compute": "auto",         # where CLIP and the face models run: auto (GPU when a working one is found), cpu, gpu
     "lap_open_version": "original",   # what opening a photo in the GUI fetches: original or medium
+    # Where the results of asking an agent land. Ordinary folders, so they can be
+    # browsed, backed up or deleted without this tool.
+    "edits_dir": "~/Pictures/Photos Edits",
+    "edit_agent": "codex",
+    "edit_timeout_s": 900,
+    "collages_dir": "~/Pictures/Photos Collages",
 }
 
 
