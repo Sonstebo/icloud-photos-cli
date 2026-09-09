@@ -1,9 +1,9 @@
 [Unit]
-Description=Bring the local iCloud photo catalogue up to date
+Description=Keep the iCloud photo catalogue, index and GUI library up to date
 After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/photos --json sync
+ExecStart=%h/.local/bin/photos --json refresh
 Nice=10
 IOSchedulingClass=idle

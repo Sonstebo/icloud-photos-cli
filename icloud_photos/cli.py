@@ -328,15 +328,17 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
         lib = lap_export.LapLibrary(library, root, thumb_size=args.thumb_size)
     except ValueError as err:
         raise CliError("lap-invalid", str(err)) from err
+    if lib.app_is_running() and not app.json:
+        print("note: the photo app is running; it will show the changes after a restart", file=sys.stderr)
 
     def progress(p: dict[str, Any]) -> None:
         if not app.json:
             print(f"  {p['done']} of {p['total']}: {p['files']} files, {p['thumbs']} thumbs ({p.get('fetched', 0)} fetched), {p['faces']} faces", file=sys.stderr)
     try:
-        photos_bin = Path(sys.executable).with_name("photos")
-        fetch = f"{photos_bin if photos_bin.exists() else 'photos'} lap-fetch {{path}}"
+        fetch = _lap_fetch_command(app)
         result = lap_export.export(app.catalog, app.cache, lib, limit=args.limit, fetch_command=fetch,
                                    fetch_thumbs=args.fetch_thumbs, adapter=app.adapter if args.fetch_thumbs else None,
+                                   open_version=args.open_version or str(app.config.values.get("lap_open_version", "original")),
                                    progress=progress)
     finally:
         lib.close()
@@ -349,6 +351,53 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refresh(app: App, args: argparse.Namespace) -> int:
+    """sync, index what is new, and update the GUI library: what the timer runs."""
+    steps: dict[str, Any] = {}
+    if (pid := _sync_pid(app)) is not None:
+        raise CliError("sync-running", f"a sync is already running (pid {pid}); see `photos status`")
+    app.paths.sync_lock.write_text(str(os.getpid()))
+    try:
+        result = run_sync(app.catalog, app.adapter, full=False)
+    finally:
+        app.paths.sync_lock.unlink(missing_ok=True)
+    steps["sync"] = {k: result[k] for k in ("mode", "records", "new", "changed", "missing") if k in result}
+    # Only load the models when there is something to index: they cost ~2 GB, and this
+    # runs hourly on a machine that may be doing something else.
+    todo = app.catalog.db.execute(
+        "SELECT COUNT(*) FROM assets a WHERE a.kind='image' AND a.hidden=0 AND a.missing_since IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM index_state s WHERE s.asset_id=a.id)").fetchone()[0]
+    if (pid := _pid(app.paths.index_lock)) is not None:
+        steps["index"] = {"todo": todo, "skipped": f"an index run is already going (pid {pid})"}
+    elif args.no_index or not todo:
+        steps["index"] = {"todo": todo, "skipped": "nothing new" if not todo else "--no-index"}
+    else:
+        app.paths.index_lock.write_text(str(os.getpid()))
+        try:
+            steps["index"] = indexing.index(app.catalog, app.adapter, app.cache, app.models, limit=args.index_limit)
+        except ModelsMissing as err:
+            steps["index"] = {"skipped": str(err)}
+        finally:
+            app.paths.index_lock.unlink(missing_ok=True)
+    library = lap_export.default_library()
+    if library is None:
+        steps["gui"] = {"skipped": "no GUI library on this machine"}
+    else:
+        lib = lap_export.LapLibrary(library, app.paths.cache_dir / "lap")
+        try:
+            steps["gui"] = lap_export.export(app.catalog, app.cache, lib, fetch_command=_lap_fetch_command(app),
+                                             open_version=str(app.config.values.get("lap_open_version", "original")))
+        finally:
+            lib.close()
+    app.emit(steps, lambda s: "\n".join(f"{k}: {v}" for k, v in s.items()))
+    return 0
+
+
+def _lap_fetch_command(app: App) -> str:
+    photos_bin = Path(sys.executable).with_name("photos")
+    return f"{photos_bin if photos_bin.exists() else 'photos'} lap-fetch {{path}}"
+
+
 def cmd_lap_fetch(app: App, args: argparse.Namespace) -> int:
     """lap's fetch-on-open command for our album: PATH is `<root>/YYYY/MM/<id>__<stem>.<ext>`."""
     target = Path(args.path)
@@ -359,11 +408,7 @@ def cmd_lap_fetch(app: App, args: argparse.Namespace) -> int:
     if row is None:
         raise CliError("no-such-asset", f"{target.name} names no asset in the catalogue")
     asset = _assets(app, [row["id"]])[0]
-    if asset["kind"] == "image":
-        version = "medium" if "medium" in asset["versions"] else (
-            "original" if (asset["versions"].get("original", {}).get("bytes") or 0) <= 4 * 1024 * 1024 else "thumb")
-    else:
-        version = "original"
+    version = lap_export.version_for_entry(target.name, asset, str(app.config.values.get("lap_open_version", "original")))
     r = _fetch(app, asset, version)
     lap_export.link(target, Path(r["path"]))
     app.emit({"id": asset["id"], "version": version, "path": r["path"], "link": str(target)},
@@ -763,6 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--thumb-size", type=int, default=512, help="lap's gallery thumbnail setting: 256, 512 (default) or 1024; a mismatch makes lap regenerate every thumbnail")
     s.add_argument("--limit", type=int, help="export only the newest N assets")
     s.add_argument("--fetch-thumbs", action="store_true", help="download thumbnails that are not cached (movies included); needs iCloud")
+    s.add_argument("--open-version", choices=("original", "medium"), help="what opening a photo fetches (config lap_open_version, default original)")
     s.set_defaults(fn=cmd_lap_export)
 
     s = sub.add_parser("lap-fetch", help="fetch the file behind a lap album entry (lap's fetch-on-open command)",
@@ -771,6 +817,14 @@ def build_parser() -> argparse.ArgumentParser:
                                    "and the file is not on disk.")
     s.add_argument("path", help="the entry's path under the album root")
     s.set_defaults(fn=cmd_lap_fetch)
+
+    s = sub.add_parser("refresh", help="sync, index what is new, and update the GUI library",
+                       description="One pass of everything that keeps the library current: an incremental sync, an "
+                                   "index run over whatever it added, and an export to the GUI library when one "
+                                   "exists. This is what the systemd timer runs.")
+    s.add_argument("--no-index", action="store_true", help="skip the index run")
+    s.add_argument("--index-limit", type=int, help="index at most N new images this pass")
+    s.set_defaults(fn=cmd_refresh)
 
     s = sub.add_parser("faces", help="faces found in photos; assign or clear a person")
     fs = s.add_subparsers(dest="faces_cmd", metavar="action", required=True)

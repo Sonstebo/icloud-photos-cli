@@ -19,6 +19,7 @@ DEFAULTS = {
     "preview_size": "thumb",   # what `show` fetches by default: thumb or medium
     "face_threshold": 0.5,     # cosine similarity for naming a face from a person's seeds
     "compute": "auto",         # where CLIP and the face models run: auto (GPU when a working one is found), cpu, gpu
+    "lap_open_version": "original",   # what opening a photo in the GUI fetches: original or medium
 }
 
 

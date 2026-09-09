@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh the iCloud photo catalogue every hour
+Description=Refresh the iCloud photo library every hour
 
 [Timer]
 OnBootSec=5min

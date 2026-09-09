@@ -7,8 +7,8 @@ through URL schemes keyed by file id. This writes the rows a folder scan
 would have produced, so lap needs no change to browse our library:
 
 - one album rooted at a tree of symlinks under our cache
-  (`<root>/YYYY/MM/<asset id>@<stem>.jpg` -> the best cached JPEG rendition; the
-  id is filename-safe as in the cache, and `@` cannot occur in it),
+  (`<root>/YYYY/MM/<asset id>@<original name>` -> that rendition once it is cached;
+  the id is filename-safe as in the cache, and `@` cannot occur in it),
 - `afiles` with our dates, dimensions, GPS, favourite and caption,
 - `athumbs` from our thumbnails (`--fetch-thumbs` downloads the missing ones,
   movies included), within lap's thumbnail size (512 by default,
@@ -25,6 +25,7 @@ links the catalogue no longer has are removed.
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -40,18 +41,26 @@ from .catalog import Catalog
 Progress = Callable[[dict[str, Any]], None]
 
 ALBUM_NAME = "iCloud Photos"
+COMMIT_EVERY = 2000
 LAP_TABLES = ("albums", "afolders", "afiles", "athumbs", "persons", "faces", "acollections", "acollections_files")
 FORMAT_LABELS = {"JPEG": "JPG", "JPE": "JPG", "JFIF": "JPG", "TIF": "TIFF", "MPG": "MPEG", "M4V": "MP4"}
 
 
+# The GUI's data directory, newest identifier first; a build may use any of them.
+APP_IDS = ("com.sonstebo.photos", "com.julyx10.lap")
+
+
 def default_library() -> Path | None:
-    """lap's first library database, if lap has run on this machine."""
-    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "com.julyx10.lap/libraries"
-    for name in ("default.db",):
-        if (base / name).exists():
-            return base / name
-    found = sorted(base.glob("*.db")) if base.exists() else []
-    return found[0] if found else None
+    """The GUI's library database, if it has run on this machine."""
+    root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    for app_id in APP_IDS:
+        base = (root / app_id / "libraries").resolve()
+        if (base / "default.db").exists():
+            return base / "default.db"
+        found = sorted(base.glob("*.db")) if base.exists() else []
+        if found:
+            return found[0]
+    return None
 
 
 def _noop(_: dict[str, Any]) -> None:
@@ -98,7 +107,16 @@ class LapLibrary:
         self.db = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout=30000")
-        self.db.execute("PRAGMA foreign_keys=ON")   # lap's tables cascade: deleting a file drops its thumbnail and faces
+        self.db.execute("PRAGMA foreign_keys=ON")   # the app's tables cascade: deleting a file drops its thumbnail and faces
+        self.db.execute("PRAGMA cache_size=-20000")  # 20 MB, not the default share of a 2 GB database
+        # One export at a time: two would fight over the same write transaction.
+        self._lock = (self.db_path.parent / f".{self.db_path.name}.export.lock").open("w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock.close()
+            self.db.close()
+            raise ValueError(f"another export is already writing {self.db_path}") from None
         have = {r[0] for r in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing = [t for t in LAP_TABLES if t not in have]
         if missing:
@@ -106,6 +124,21 @@ class LapLibrary:
 
     def close(self) -> None:
         self.db.close()
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+        except (OSError, ValueError):
+            pass
+
+    def app_is_running(self) -> bool:
+        """Whether a GUI process holds this library open. Writing while it runs is
+        safe (WAL, 30 s busy timeout) but its own writes can fail, so callers warn."""
+        import subprocess
+        try:
+            out = subprocess.run(["pgrep", "-x", "Photos", "-x", "Lap"], capture_output=True, text=True, timeout=5)
+            return out.returncode == 0 and bool(out.stdout.strip())
+        except Exception:  # noqa: BLE001 - pgrep is optional
+            return False
 
     # --- album and folders ----------------------------------------------------
     def album_id(self) -> int:
@@ -220,6 +253,25 @@ def asset_id_of(entry_name: str) -> str:
     return entry_name.split("@", 1)[0]
 
 
+def version_for_entry(entry_name: str, asset: dict[str, Any], preferred: str = "original") -> str:
+    """The rendition an entry stands for: the preferred one when the asset has it and
+    its type matches the entry's extension, else whatever does."""
+    versions = versions_of(asset)
+    suffix = Path(entry_name).suffix.lower()
+    order = [preferred, "original", "medium", "thumb"] if asset.get("kind") == "image" else [
+        "original", "medium_image", "thumb_image"]
+    for v in order:
+        info = versions.get(v)
+        if not info:
+            continue
+        name = info.get("filename") or ""
+        if v == "medium" and suffix == ".jpg":
+            return v
+        if Path(name).suffix.lower() == suffix or v == preferred:
+            return v
+    return next((v for v in order if v in versions), "thumb")
+
+
 def link(path: Path, target: Path | None) -> None:
     """A symlink at `path` to `target`, or none when there is nothing to point at."""
     if path.is_symlink() or path.exists():
@@ -242,11 +294,13 @@ def rendition_dims(asset: dict[str, Any], version: str) -> tuple[int | None, int
 
 
 def _fetch_thumb(a: dict[str, Any], adapter: Any, cache: Cache) -> Path | None:
-    """Download the thumbnail rendition of one asset into the cache (movies have `thumb_image`)."""
-    versions = a.get("versions") or {}
-    if isinstance(versions, str):
-        versions = json.loads(versions)
+    """Download something to make a thumbnail from: the thumbnail rendition (movies call
+    it `thumb_image`), else the medium preview, which is what iCloud offers for HEIC and
+    RAW imports that have no thumbnail at all."""
+    versions = versions_of(a)
     version = "thumb" if a.get("kind") == "image" else "thumb_image"
+    if version not in versions:
+        version = "medium" if "medium" in versions else "medium_image"
     if version not in versions:
         return None
     try:
@@ -256,7 +310,7 @@ def _fetch_thumb(a: dict[str, Any], adapter: Any, cache: Cache) -> Path | None:
     if not data:
         return None
     try:
-        return cache.put(a["id"], version if a.get("kind") == "image" else "thumb", data, ".jpg")
+        return cache.put(a["id"], version, data, ".jpg")
     except Exception:  # noqa: BLE001 - cache full: still usable for this run
         tmp = cache.root / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
@@ -265,10 +319,15 @@ def _fetch_thumb(a: dict[str, Any], adapter: Any, cache: Cache) -> Path | None:
         return p
 
 
+def versions_of(a: dict[str, Any]) -> dict[str, Any]:
+    v = a.get("versions") or {}
+    return json.loads(v) if isinstance(v, str) else v
+
+
 def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None = None,
            fetch_command: str | None = None, fetch_thumbs: bool = False, adapter: Any = None,
-           progress: Progress = _noop) -> dict[str, Any]:
-    result: dict[str, Any] = {"library": str(lap.db_path), "root": str(lap.root), "files": 0, "linked": 0,
+           open_version: str = "original", progress: Progress = _noop) -> dict[str, Any]:
+    result: dict[str, Any] = {"library": str(lap.db_path), "root": str(lap.root), "open_version": open_version, "files": 0, "linked": 0,
                               "thumbs": 0, "embeddings": 0, "faces": 0, "people": 0, "collections": 0, "skipped": 0}
     album = lap.album_id()
     lap.set_fetch_command(album, fetch_command)
@@ -285,6 +344,12 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
     lap.db.execute("BEGIN")
     try:
         for n, a in enumerate(assets, 1):
+            if n % COMMIT_EVERY == 0:
+                # A single transaction over every thumbnail blob costs gigabytes of page
+                # cache on a library this size. Committing in batches keeps it flat; the
+                # export is idempotent, so a partial pass is picked up by the next one.
+                lap.db.execute("COMMIT")
+                lap.db.execute("BEGIN")
             taken = _seconds(a.get("taken")) or _seconds(a.get("added")) or 0
             when = datetime.fromtimestamp(taken) if taken else datetime(1970, 1, 1)
             ykey, mkey = f"{when.year:04d}", f"{when.year:04d}/{when.month:02d}"
@@ -292,22 +357,22 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
                 folders[ykey] = lap.folder_id(album, lap.root / ykey, True)
             if mkey not in folders:
                 folders[mkey] = lap.folder_id(album, lap.root / mkey, False)
-            stem = Path(a["filename"] or a["id"]).stem
+            filename = a["filename"] or f"{a['id']}.jpg"
+            stem, suffix = Path(filename).stem, Path(filename).suffix
             is_image = a.get("kind") == "image"
-            # the file the row stands for: the best cached JPEG rendition of an image, the original of a movie
-            if is_image:
-                # the entry stands for the medium preview only: linking the thumbnail would make
-                # lap's viewer show 480 px and never ask the fetch-on-open hook for more
-                target = cache.peek(a["id"], "medium")
-                linked_version = "medium"
-                name = f"{safe_name(a['id'])}@{stem}.jpg"
-            else:
-                target = cache.peek(a["id"], "original")
-                linked_version = "original"
-                name = f"{safe_name(a['id'])}@{a['filename'] or stem}"
+            # The entry stands for one rendition and is named after it, because the app picks
+            # its decoder from the extension: an original HEIC named .jpg would go to the
+            # webview, which cannot read it. `open_version` says which rendition that is; the
+            # entry dangles until the fetch-on-open command materialises it.
+            linked_version = open_version if open_version in (a_versions := versions_of(a)) else (
+                "medium" if "medium" in a_versions else "original")
+            if linked_version == "medium":
+                suffix = ".jpg"      # the medium rendition is always JPEG
+            target = cache.peek(a["id"], linked_version)
+            name = f"{safe_name(a['id'])}@{stem}{suffix}"
             values = {
                 "size": int(a.get("bytes") or 0), "file_type": 1 if is_image else 2,
-                "format_label": "JPG" if is_image else format_label(a.get("filename") or ""),
+                "format_label": format_label(name),
                 "created_at": taken, "modified_at": taken, "taken_date": taken,
                 "width": a.get("width"), "height": a.get("height"),
                 "is_favorite": int(bool(a.get("favorite"))), "comments": a.get("caption"),
@@ -336,9 +401,10 @@ def export(catalog: Catalog, cache: Cache, lap: LapLibrary, *, limit: int | None
             if thumb is not None:
                 lap.put_thumb(fid, thumb.read_bytes(), int(target.stat().st_mtime) if target is not None else None)
                 result["thumbs"] += 1
-            elif target is None:
-                # nothing on disk to make one from: an error row keeps lap from trying
-                # (it would spawn ffmpeg for every movie entry on every start)
+            elif target is None and not is_image:
+                # A movie with nothing on disk: an error row stops the app spawning ffmpeg
+                # for it on every start. An image is left without a row, so the app can
+                # make its own thumbnail once the fetch-on-open command brings the file in.
                 lap.put_thumb_error(fid)
             if faces:
                 # our boxes are in the pixels of the rendition the face pass saw; lap wants the linked file's

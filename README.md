@@ -39,16 +39,30 @@ Apple Silicon and the vision models need pull requests
 `aarch64-conv2d`, `docs/BUILDING.md`) and `pip install -e python/`. Without a
 working provider everything runs on the CPU.
 
-## Browsing with lap
+## Browsing with the Photos app
 
-[lap](https://github.com/julyx10/lap) is an open-source desktop photo manager
-(Tauri, local AI, map, faces, editor). `photos lap-export` writes the
-catalogue into a lap library: one album of symlinks under the cache, rows with
-dates, GPS, favourites and captions, our thumbnails, our CLIP vectors (lap uses
-the same ViT-B/32 weights, so its semantic search runs on them), people, faces
-and collections. Run lap once so it creates its library, export, restart lap.
-Photos whose preview is not cached show their thumbnail but cannot open until
-fetched.
+The desktop app is a fork of [lap](https://github.com/julyx10/lap) (Tauri,
+Rust and Vue, local AI, map, faces, editor) with two additions offered back
+upstream: an album may be **managed**, meaning an external tool owns its rows
+and the app never scans or prunes it, and it may name a **fetch-on-open**
+command that materialises a file the moment someone opens it.
+
+`photos lap-export` writes the catalogue into the app's library: one album of
+symlinks under the cache, rows with dates, GPS, favourites and captions, our
+thumbnails, our CLIP vectors (the app uses the same ViT-B/32 weights, so its
+semantic search runs on them), people, faces and collections. Each entry is
+named after the original file, so the app decodes HEIC and RAW itself, and it
+stays a dangling link until you open the photo: then the app runs
+`photos lap-fetch`, the full-resolution original is downloaded into the bounded
+cache, and eviction removes it again later. `config set lap_open_version medium`
+fetches the 2048 px preview instead; `photos original ID --pin` keeps a file
+for good.
+
+```sh
+Photos                                  # once, so the app creates its library
+photos lap-export                       # then restart the app
+photos refresh                          # sync + index + export, what the timer runs
+```
 
 ## Install
 
@@ -107,9 +121,11 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `collection list\|create\|delete\|add\|remove\|show` | ordered sets of ids for a project | no |
 | `people [--all]` | people from iCloud's People album, with photos found per person | no |
 | `index [--limit N] [--seed] [--rematch] [--threshold T] [--fetch-models] [--background]` | CLIP embeddings and faces | yes |
-| `lap-export [--library P] [--root P] [--limit N]` | write the catalogue into a [lap](https://github.com/julyx10/lap) library for browsing | no |
+| `refresh [--no-index] [--index-limit N]` | sync, index what is new, update the GUI library | yes |
+| `lap-export [--library P] [--root P] [--limit N] [--fetch-thumbs] [--open-version V]` | write the catalogue into the GUI's library | only with `--fetch-thumbs` |
+| `lap-fetch PATH` | fetch the file behind one GUI entry (the app's fetch-on-open command) | yes |
 | `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
-| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute` | no |
+| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
 includes the whole of the period given. Exit codes: 1 error, 2 needs a
