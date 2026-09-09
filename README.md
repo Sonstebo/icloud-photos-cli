@@ -116,6 +116,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
 | `select [QUERY] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
 | `compose [COLLECTION] [--id ID...] [--template justified\|grid\|hero\|filmstrip\|spread\|scatter] [--shape 3:2\|square\|a4-landscape\|a4-portrait\|spread\|16:9] [--gap N] [--count N] [--background C] [--long-edge PX] [--originals] [--no-face-safe] [--plan] [--out FILE]` | turn a set of photos into one picture; no crop cuts a face | only with `--originals` |
+| `book list\|create\|delete\|add\|remove\|move\|show\|export` | ordered pages of collages, exported as one PDF | only with `--originals` |
 | `info ID...` | every field, cached renditions, albums, collections | no |
 | `show ID... [--size thumb\|medium]` | fetch previews, print `id<TAB>path` | if not cached |
 | `original ID... [--pin] [--version V]` | fetch full files, print paths | if not cached |
@@ -295,6 +296,30 @@ No photograph is ever stretched, only cropped.
 `--plan` prints the geometry and writes no file, which is what a preview draws.
 Results land in `~/Pictures/Photos Collages/<date>/`, an ordinary folder
 (`collages_dir`).
+
+## Books
+
+A book is an ordered list of pages, and a page is a recipe rather than a
+picture: the photos it uses and how to lay them out. Nothing is drawn until the
+book is exported, so pages can be reordered or relaid at any time and the export
+always matches what the pages say.
+
+```
+$ photos book create "Summer 2024" --shape a4-landscape
+$ photos book add "Summer 2024" --collection "Lofoten" --template justified --caption "The first day"
+$ photos book add "Summer 2024" --collection "Lofoten" --template hero
+$ photos book move "Summer 2024" --page 2 --to 1
+$ photos book export "Summer 2024" --originals
+```
+
+Every page has the book's shape, because a PDF gives its pages one size and a
+page of a different shape would be squashed into it. A caption is written into a
+strip the layout reserves inside the page for exactly that reason: adding one
+underneath afterwards would make a captioned page taller than an uncaptioned one.
+
+`export` without `--originals` gives a draft in seconds from cached thumbnails,
+at 150 dpi. With it, the originals are fetched and the PDF comes out at 300 dpi,
+A4 landscape measuring 842 by 595 points, which is A4.
 
 ## Editing a photo by asking
 

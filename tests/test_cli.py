@@ -1207,7 +1207,37 @@ class ComposeRenderTests(unittest.TestCase):
         a, b = self.dir / "a.png", self.dir / "b.png"
         self.c.render(self.photos, a, template="scatter", shape="3:2", long_edge=500)
         self.c.render(self.photos, b, template="scatter", shape="3:2", long_edge=500)
-        self.assertEqual(a.read_bytes(), b.read_bytes())
+        # compare the picture, which is what the promise is about
+        out = subprocess.run(["magick", "compare", "-metric", "AE", str(a), str(b), "null:"],
+                             capture_output=True, text=True)
+        self.assertEqual((out.stderr.strip().split()[0], a.read_bytes()), ("0", b.read_bytes()))
+
+    def test_pages_bind_into_one_pdf_and_a_missing_page_is_refused(self):
+        pages = []
+        for i in range(3):
+            out = self.dir / f"p{i}.jpg"
+            self.c.render(self.photos, out, template="grid", shape="a4-landscape", long_edge=500)
+            pages.append(out)
+        book = self.dir / "book.pdf"
+        got = self.c.export_pdf(pages, book, dpi=150)
+        self.assertEqual(got["pages"], 3)
+        self.assertGreater(book.stat().st_size, 0)
+        sizes = subprocess.run(["magick", "identify", "-format", "%wx%h\n", str(book)],
+                               capture_output=True, text=True).stdout.split()
+        self.assertEqual(len(set(sizes)), 1, "every page of a PDF has one size")
+        with self.assertRaises(self.c.ComposeFailed):
+            self.c.export_pdf([], book)
+        with self.assertRaises(self.c.ComposeFailed):
+            self.c.export_pdf([self.dir / "never-drawn.jpg"], book)
+
+    def test_a_caption_is_written_inside_the_page(self):
+        out = self.dir / "captioned.jpg"
+        plain = self.dir / "plain.jpg"
+        self.c.render(self.photos, plain, shape="a4-landscape", long_edge=600)
+        got = self.c.render(self.photos, out, shape="a4-landscape", long_edge=600,
+                            caption="A day at the beach")
+        self.assertGreater(got["caption_band"], 0)
+        self.assertEqual(self.c.image_size(out), self.c.image_size(plain))
 
     def test_a_missing_source_is_reported_not_a_blank_page(self):
         gone = [self.c.Photo("x", self.dir / "not-here.jpg", 100, 100, [])]
@@ -1225,3 +1255,95 @@ class ComposeCliTests(CliTest):
         # a movie is not composed, and saying so beats drawing an empty page
         _, err = self.j("compose", "--id", "A009/x+y==", expect=1)
         self.assertIn("nothing-to-compose", err)
+
+
+# --- books -------------------------------------------------------------------
+
+class CaptionTests(unittest.TestCase):
+    def setUp(self):
+        from icloud_photos import compose
+        self.c = compose
+
+    def test_a_caption_takes_room_inside_the_page_not_below_it(self):
+        photos = [cphoto(f"p{i}", 4032, 3024) for i in range(4)]
+        plain = self.c.plan(photos, shape="a4-landscape")
+        titled = self.c.plan(photos, shape="a4-landscape", caption="A day at the beach")
+        # the page is the same size either way, or a PDF could not bind the two
+        self.assertEqual((plain["width"], plain["height"]), (titled["width"], titled["height"]))
+        self.assertEqual(plain["caption_band"], 0)
+        self.assertGreater(titled["caption_band"], 0)
+        # and the photographs have moved up to make room
+        lowest = max(s["y"] + s["h"] for s in titled["slots"])
+        self.assertLessEqual(lowest, titled["height"] - titled["caption_band"] + 1)
+
+    def test_an_empty_caption_reserves_nothing(self):
+        got = self.c.plan([cphoto("p", 100, 100)], caption="   ")
+        self.assertEqual(got["caption_band"], 0)
+
+
+class BookTests(CliTest):
+    def test_a_book_is_pages_in_order_that_can_be_moved_and_dropped(self):
+        self.j("sync")
+        self.j("collection", "create", "Trip")
+        self.j("collection", "add", "Trip", "A001/x+y==", "A002/x+y==")
+
+        r, _ = self.j("book", "create", "Summer", "--shape", "a4-landscape")
+        self.assertTrue(r["created"])
+        r, _ = self.j("book", "create", "Summer")
+        self.assertFalse(r["created"], "creating twice must not add a second book")
+
+        for template, caption in (("justified", "Day one"), ("grid", None), ("hero", "The last one")):
+            args = ["book", "add", "Summer", "--collection", "Trip", "--template", template]
+            if caption:
+                args += ["--caption", caption]
+            self.j(*args)
+        shown, _ = self.j("book", "show", "Summer")
+        self.assertEqual([p["template"] for p in shown["pages"]], ["justified", "grid", "hero"])
+        self.assertEqual([p["position"] for p in shown["pages"]], [1, 2, 3])
+        self.assertEqual(shown["shape"], "a4-landscape")
+
+        self.j("book", "move", "Summer", "--page", "3", "--to", "1")
+        shown, _ = self.j("book", "show", "Summer")
+        self.assertEqual([p["template"] for p in shown["pages"]], ["hero", "justified", "grid"])
+        self.assertEqual([p["position"] for p in shown["pages"]], [1, 2, 3])
+
+        self.j("book", "remove", "Summer", "--page", "2")
+        shown, _ = self.j("book", "show", "Summer")
+        self.assertEqual([p["template"] for p in shown["pages"]], ["hero", "grid"])
+        self.assertEqual([p["position"] for p in shown["pages"]], [1, 2], "pages must renumber")
+
+        listed, _ = self.j("book", "list")
+        self.assertEqual((listed[0]["name"], listed[0]["pages"]), ("Summer", 2))
+
+    def test_a_page_can_name_its_photos_instead_of_a_collection(self):
+        self.j("sync")
+        self.j("book", "create", "Direct")
+        self.j("book", "add", "Direct", "--id", "A001/x+y==", "A002/x+y==")
+        shown, _ = self.j("book", "show", "Direct")
+        self.assertEqual(shown["pages"][0]["ids"], ["A001/x+y==", "A002/x+y=="])
+        self.assertIsNone(shown["pages"][0]["collection"])
+
+    def test_the_things_that_cannot_work_say_so(self):
+        self.j("sync")
+        _, err = self.j("book", "show", "Nope", expect=1)
+        self.assertIn("unknown-book", err)
+        self.j("book", "create", "Empty")
+        _, err = self.j("book", "add", "Empty", expect=1)
+        self.assertIn("nothing-on-the-page", err)
+        _, err = self.j("book", "add", "Empty", "--collection", "Missing", expect=1)
+        self.assertIn("unknown-collection", err)
+        _, err = self.j("book", "export", "Empty", expect=1)
+        self.assertIn("empty-book", err)
+        _, err = self.j("book", "remove", "Empty", "--page", "7", expect=1)
+        self.assertIn("no-such-page", err)
+
+    def test_deleting_a_book_leaves_the_photos_and_the_collection_alone(self):
+        self.j("sync")
+        self.j("collection", "create", "Trip")
+        self.j("collection", "add", "Trip", "A001/x+y==")
+        self.j("book", "create", "Gone")
+        self.j("book", "add", "Gone", "--collection", "Trip")
+        self.j("book", "delete", "Gone")
+        self.assertEqual(self.j("book", "list")[0], [])
+        still, _ = self.j("collection", "show", "Trip")
+        self.assertEqual(still["count"], 1)

@@ -856,6 +856,115 @@ def cmd_compose(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def _book_or_fail(app: App, name: str) -> dict[str, Any]:
+    book = app.catalog.book(name)
+    if book is None:
+        raise CliError("unknown-book", f"no book {name!r}; see `photos book list`")
+    return book
+
+
+def cmd_book(app: App, args: argparse.Namespace) -> int:
+    """An ordered list of pages, exported as one PDF."""
+    from . import compose as composer
+
+    cmd = args.book_cmd
+    if cmd == "list":
+        rows = app.catalog.books()
+        app.emit(rows, lambda rs: "\n".join(
+            f"{r['pages']:>4} pages  {r['shape']:<14} {r['name']}" + (f"  {r['note']}" if r["note"] else "")
+            for r in rs) or "no books yet")
+    elif cmd == "create":
+        made = app.catalog.book_create(args.name, args.shape, args.note)
+        app.emit({"name": args.name, "shape": args.shape, "created": made},
+                 lambda r: f"{'created' if r['created'] else 'already exists'}: {r['name']} ({r['shape']})")
+    elif cmd == "delete":
+        _book_or_fail(app, args.name)
+        app.catalog.book_delete(args.name)
+        app.emit({"name": args.name, "deleted": True},
+                 lambda r: f"deleted book {r['name']} (photos and collages untouched)")
+    elif cmd == "add":
+        _book_or_fail(app, args.name)
+        if not args.collection and not args.id:
+            raise CliError("nothing-on-the-page", "a page needs --collection NAME or --id ID...")
+        if args.collection and not app.catalog.collection_exists(args.collection):
+            raise CliError("unknown-collection",
+                           f"no collection {args.collection!r}; see `photos collection list`")
+        ids = [_asset_for(app, i)["id"] for i in (args.id or [])] or None
+        page = app.catalog.book_add_page(args.name, collection=args.collection, ids=ids,
+                                         template=args.template, caption=args.caption)
+        pages = app.catalog.book_pages(args.name)
+        app.emit({"book": args.name, "page": len(pages), "id": page},
+                 lambda r: f"page {r['page']} added to {r['book']}")
+    elif cmd == "remove":
+        _book_or_fail(app, args.name)
+        if not app.catalog.book_remove_page(args.name, args.page):
+            raise CliError("no-such-page", f"{args.name} has no page {args.page}")
+        app.emit({"book": args.name, "removed": args.page},
+                 lambda r: f"removed page {r['removed']} from {r['book']}")
+    elif cmd == "move":
+        _book_or_fail(app, args.name)
+        if not app.catalog.book_move_page(args.name, args.page, args.to):
+            raise CliError("no-such-page", f"{args.name} has no page {args.page} or {args.to}")
+        app.emit({"book": args.name, "moved": args.page, "to": args.to},
+                 lambda r: f"page {r['moved']} is now page {r['to']}")
+    elif cmd == "show":
+        book = _book_or_fail(app, args.name)
+        pages = app.catalog.book_pages(args.name)
+        app.emit({"name": args.name, "shape": book["shape"], "pages": pages},
+                 lambda r: "\n".join(
+                     [f"{r['name']} ({r['shape']})"] +
+                     [f"  {p['position']:>3}. {p['template']:<10} "
+                      f"{p['collection'] or str(len(p['ids'] or [])) + ' photos'}"
+                      + (f"  \u2014 {p['caption']}" if p["caption"] else "")
+                      for p in r["pages"]] or ["  no pages yet"]))
+    elif cmd == "export":
+        book = _book_or_fail(app, args.name)
+        pages = app.catalog.book_pages(args.name)
+        if not pages:
+            raise CliError("empty-book", f"{args.name} has no pages; add one with `photos book add`")
+        root = Path(str(app.config.values.get("collages_dir") or composer.DEFAULT_DIR))
+        out = Path(args.out).expanduser() if args.out else composer.output_path(
+            root, args.name, "book", book["shape"], ".pdf")
+        work = out.parent / f".{out.stem}-pages"
+        work.mkdir(parents=True, exist_ok=True)
+        long_edge = None if args.originals else composer.DRAFT_LONG_EDGE
+        drawn: list[Path] = []
+        fetched: list[str] = []
+        try:
+            for page in pages:
+                if page["collection"]:
+                    assets = app.catalog.collection_items(page["collection"])
+                else:
+                    assets = [_asset_for(app, i) for i in (page["ids"] or [])]
+                assets = [a for a in assets if a["kind"] == "image"]
+                if len(assets) < 1:
+                    raise CliError("empty-page",
+                                   f"page {page['position']} of {args.name} has no photos left")
+                photos = [_compose_photo(app, a, args.originals, fetched) for a in assets]
+                target = work / f"page-{page['position']:03d}.jpg"
+                if not app.json:
+                    print(f"page {page['position']} of {len(pages)}", file=sys.stderr)
+                composer.render(photos, target, template=page["template"], shape=book["shape"],
+                                gap=args.gap, long_edge=long_edge, background=args.background,
+                                caption=page["caption"])
+                drawn.append(target)
+            result = composer.export_pdf(drawn, out, dpi=300 if args.originals else 150)
+        except composer.ComposeFailed as err:
+            raise CliError("compose-failed", str(err)) from err
+        finally:
+            if not args.keep_pages:
+                shutil.rmtree(work, ignore_errors=True)
+        result["book"] = args.name
+        result["shape"] = book["shape"]
+        result["draft"] = not args.originals
+        result["fetched"] = len(fetched)
+        app.emit(result, lambda r: (
+            f"{r['path']}\n{r['pages']} pages, {human_bytes(r['bytes'])} in {r['seconds']}s"
+            + (f"; fetched {r['fetched']} originals" if r["fetched"] else "")
+            + ("; draft resolution, use --originals to print it" if r["draft"] else "")))
+    return 0
+
+
 def _assets(app: App, ids: list[str]) -> list[dict[str, Any]]:
     out = []
     for asset_id in ids:
@@ -1212,6 +1321,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--plan", action="store_true", help="print the geometry; write no file")
     s.add_argument("--out", metavar="FILE", help="write here instead of the dated folder")
     s.set_defaults(fn=cmd_compose)
+
+    s = sub.add_parser("book", help="ordered pages of collages, exported as one PDF",
+                       description="A page is a recipe, not a picture: the photos it uses and how "
+                                   "to lay them out. Nothing is drawn until the book is exported, "
+                                   "so pages can be reordered at any time. Every page has the "
+                                   "book's shape, because a PDF gives its pages one size.")
+    bk = s.add_subparsers(dest="book_cmd", required=True)
+    bk.add_parser("list", help="all books")
+    x = bk.add_parser("create"); x.add_argument("name")
+    x.add_argument("--shape", default="a4-landscape",
+                   choices=("3:2", "square", "a4-landscape", "a4-portrait", "spread", "16:9"))
+    x.add_argument("--note")
+    x = bk.add_parser("delete", help="remove the book only; photos and collages stay")
+    x.add_argument("name")
+    x = bk.add_parser("add", help="append a page")
+    x.add_argument("name")
+    x.add_argument("--collection", metavar="NAME", help="the page holds this collection")
+    x.add_argument("--id", nargs="+", metavar="ID", help="or these photos, by id or GUI entry path")
+    x.add_argument("--template", default="justified",
+                   choices=("justified", "grid", "hero", "filmstrip", "spread", "scatter"))
+    x.add_argument("--caption", help="a line of text under the page")
+    x = bk.add_parser("remove", help="drop a page and renumber the rest")
+    x.add_argument("name"); x.add_argument("--page", type=int, required=True)
+    x = bk.add_parser("move", help="reorder a page")
+    x.add_argument("name"); x.add_argument("--page", type=int, required=True)
+    x.add_argument("--to", type=int, required=True)
+    x = bk.add_parser("show", help="the pages in order"); x.add_argument("name")
+    x = bk.add_parser("export", help="draw every page and bind them into a PDF")
+    x.add_argument("name")
+    x.add_argument("--out", metavar="FILE", help="write here instead of the dated folder")
+    x.add_argument("--originals", action="store_true",
+                   help="fetch full-resolution originals and export at 300 dpi")
+    x.add_argument("--gap", type=int, default=8, metavar="N")
+    x.add_argument("--background", default="white", metavar="COLOUR")
+    x.add_argument("--keep-pages", action="store_true", help="leave the rendered pages on disk")
+    s.set_defaults(fn=cmd_book)
 
     s = sub.add_parser("info", help="everything known about one or more assets")
     s.add_argument("id", nargs="+")

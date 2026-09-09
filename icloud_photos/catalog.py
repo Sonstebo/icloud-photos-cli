@@ -100,6 +100,28 @@ CREATE TABLE IF NOT EXISTS edit_jobs (
     variant INTEGER, error TEXT, pid INTEGER,
     created TEXT NOT NULL, started TEXT, finished TEXT);
 CREATE INDEX IF NOT EXISTS edit_jobs_state ON edit_jobs(state, id);
+
+-- A book is an ordered list of pages, and a page is a recipe rather than a
+-- picture: the photos it uses and how to lay them out. Nothing is rendered
+-- until the book is exported, so a page can be reordered or relaid at any time
+-- and the export always matches what the pages say.
+CREATE TABLE IF NOT EXISTS books (
+    name TEXT PRIMARY KEY,
+    shape TEXT NOT NULL,
+    note TEXT,
+    created TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS book_pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    book TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    collection TEXT,
+    ids TEXT,                     -- JSON array, when the page names its photos directly
+    template TEXT NOT NULL,
+    caption TEXT,
+    created TEXT NOT NULL,
+    FOREIGN KEY (book) REFERENCES books(name) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS book_pages_book ON book_pages(book, position);
 """
 
 
@@ -629,6 +651,81 @@ class Catalog:
         return removed
 
     # --- edited versions ------------------------------------------------------
+    # --- books ---------------------------------------------------------------
+
+    def book_create(self, name: str, shape: str, note: str | None = None) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO books (name, shape, note, created) VALUES (?,?,?,?)",
+            (name, shape, note, now()))
+        return cur.rowcount > 0
+
+    def book(self, name: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM books WHERE name=?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def books(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT b.*, (SELECT COUNT(*) FROM book_pages p WHERE p.book = b.name) AS pages "
+            "FROM books b ORDER BY b.name")]
+
+    def book_delete(self, name: str) -> bool:
+        self.db.execute("BEGIN")
+        self.db.execute("DELETE FROM book_pages WHERE book=?", (name,))
+        cur = self.db.execute("DELETE FROM books WHERE name=?", (name,))
+        self.db.execute("COMMIT")
+        return cur.rowcount > 0
+
+    def book_set(self, name: str, **fields: Any) -> None:
+        if not fields:
+            return
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE books SET {sets} WHERE name=?", [*fields.values(), name])
+
+    def book_add_page(self, book: str, *, collection: str | None, ids: list[str] | None,
+                      template: str, caption: str | None = None) -> int:
+        pos = self.db.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM book_pages WHERE book=?", (book,)).fetchone()[0]
+        cur = self.db.execute(
+            "INSERT INTO book_pages (book, position, collection, ids, template, caption, created) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (book, pos + 1, collection, json.dumps(ids) if ids else None, template, caption, now()))
+        return int(cur.lastrowid or 0)
+
+    def book_pages(self, book: str) -> list[dict[str, Any]]:
+        out = []
+        for r in self.db.execute(
+                "SELECT * FROM book_pages WHERE book=? ORDER BY position, id", (book,)):
+            d = dict(r)
+            d["ids"] = json.loads(d["ids"]) if d["ids"] else None
+            out.append(d)
+        return out
+
+    def book_remove_page(self, book: str, position: int) -> bool:
+        cur = self.db.execute("DELETE FROM book_pages WHERE book=? AND position=?", (book, position))
+        if cur.rowcount:
+            self._renumber_pages(book)
+        return cur.rowcount > 0
+
+    def book_move_page(self, book: str, position: int, to: int) -> bool:
+        pages = self.book_pages(book)
+        if not (1 <= position <= len(pages)) or not (1 <= to <= len(pages)):
+            return False
+        order = [p["id"] for p in pages]
+        order.insert(to - 1, order.pop(position - 1))
+        self.db.execute("BEGIN")
+        for i, page_id in enumerate(order, 1):
+            self.db.execute("UPDATE book_pages SET position=? WHERE id=?", (i, page_id))
+        self.db.execute("COMMIT")
+        return True
+
+    def _renumber_pages(self, book: str) -> None:
+        rows = self.db.execute(
+            "SELECT id FROM book_pages WHERE book=? ORDER BY position, id", (book,)).fetchall()
+        self.db.execute("BEGIN")
+        for i, r in enumerate(rows, 1):
+            self.db.execute("UPDATE book_pages SET position=? WHERE id=?", (i, r["id"]))
+        self.db.execute("COMMIT")
+
     def add_variant(self, asset_id: str, parent: int | None, path: str, prompt: str, method: str | None,
                     source_version: str | None, width: int | None, height: int | None, bytes_: int) -> int:
         cur = self.db.execute(

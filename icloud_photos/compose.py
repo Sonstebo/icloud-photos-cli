@@ -326,8 +326,14 @@ TEMPLATES: dict[str, Callable[..., list[Slot]]] = {
 
 # --- the picture ------------------------------------------------------------
 
+def caption_band(page_width: int) -> int:
+    """How much of the page a line of text under the photographs takes."""
+    return max(28, round(page_width * 0.045))
+
+
 def plan(photos: Sequence[Photo], *, template: str = "justified", shape: str = "3:2",
-         gap: int = 8, long_edge: int | None = None, face_safe: bool = True) -> dict[str, Any]:
+         gap: int = 8, long_edge: int | None = None, face_safe: bool = True,
+         caption: str | None = None) -> dict[str, Any]:
     """The geometry, without making a file. This is what a preview draws."""
     if template not in TEMPLATES:
         raise ComposeFailed(f"no template {template!r}; try " + ", ".join(sorted(TEMPLATES)))
@@ -340,7 +346,11 @@ def plan(photos: Sequence[Photo], *, template: str = "justified", shape: str = "
         k = long_edge / max(pw, ph)
         pw, ph = max(1, int(round(pw * k))), max(1, int(round(ph * k)))
     page_gap = gap * max(pw, ph) / 4000.0                 # the gap is a fraction of the page, not pixels
-    slots = TEMPLATES[template](photos, float(pw), float(ph), page_gap)
+    # A caption takes room *inside* the page. Adding it afterwards would make a
+    # captioned page taller than an uncaptioned one, and a PDF gives its pages one
+    # size, so the two would not survive being bound together.
+    band = caption_band(pw) if (caption and caption.strip()) else 0
+    slots = TEMPLATES[template](photos, float(pw), float(ph - band), page_gap)
     out = []
     for s in slots:
         inner_w = max(1.0, s.w - 2 * s.mount)
@@ -354,13 +364,13 @@ def plan(photos: Sequence[Photo], *, template: str = "justified", shape: str = "
     return {"template": template, "shape": shape, "width": pw, "height": ph,
             "gap": round(page_gap), "face_safe": face_safe,
             "note": f"a draft of {shape}; {full_w}x{full_h} is {note}" if drafted else note,
-            "print_size": [full_w, full_h], "draft": drafted,
+            "print_size": [full_w, full_h], "draft": drafted, "caption_band": band,
             "photos": len(photos), "slots": out}
 
 
 def render(photos: Sequence[Photo], out_path: Path, *, template: str = "justified",
            shape: str = "3:2", gap: int = 8, long_edge: int | None = None,
-           face_safe: bool = True, background: str = "white",
+           face_safe: bool = True, background: str = "white", caption: str | None = None,
            memory_limit: str = "512MiB", timeout: int = 900,
            progress: Callable[[str], None] = lambda _s: None) -> dict[str, Any]:
     """Compose the page with ImageMagick and write it to `out_path`."""
@@ -368,7 +378,7 @@ def render(photos: Sequence[Photo], out_path: Path, *, template: str = "justifie
     if magick is None:
         raise ComposeFailed("ImageMagick 7 (`magick`) is not installed; it is what draws the page")
     laid = plan(photos, template=template, shape=shape, gap=gap,
-                long_edge=long_edge, face_safe=face_safe)
+                long_edge=long_edge, face_safe=face_safe, caption=caption)
     by_id = {p.id: p for p in photos}
     started = time.time()
 
@@ -397,7 +407,10 @@ def render(photos: Sequence[Photo], out_path: Path, *, template: str = "justifie
             piece += ["-background", "none", "-rotate", str(slot["rotate"])]
         piece += [")", "-geometry", f"+{slot['x']}+{slot['y']}", "-composite"]
         args += piece
-    args += ["-quality", "92", str(out_path)]
+    # ImageMagick stamps the creation time into PNG text chunks, which would make
+    # two identical pages differ as files. The picture is the output, not the clock.
+    args += ["+set", "date:create", "+set", "date:modify",
+             "-define", "png:exclude-chunks=date,time", "-quality", "92", str(out_path)]
 
     progress(f"composing {len(laid['slots'])} photos at {laid['width']}x{laid['height']}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -409,10 +422,65 @@ def render(photos: Sequence[Photo], out_path: Path, *, template: str = "justifie
         detail = (run.stderr or "").strip().splitlines()[-1:] or [""]
         raise ComposeFailed(f"ImageMagick could not draw the page: {detail[0][:300]}")
 
+    if laid["caption_band"]:
+        add_caption(magick, out_path, caption.strip(), laid["width"],
+                    laid["caption_band"], background, timeout)
+        laid["caption"] = caption.strip()
+
     laid["path"] = str(out_path)
     laid["bytes"] = out_path.stat().st_size
     laid["seconds"] = round(time.time() - started, 1)
     return laid
+
+
+def export_pdf(pages: Sequence[Path], out_path: Path, *, dpi: int = 300,
+               memory_limit: str = "512MiB", timeout: int = 1800) -> dict[str, Any]:
+    """Bind rendered pages into one PDF.
+
+    Every page of a book is the same shape, which is why the book carries the
+    shape and the pages do not: a PDF gives its pages one size, and a page of a
+    different shape would be squashed into it.
+    """
+    magick = shutil.which("magick")
+    if magick is None:
+        raise ComposeFailed("ImageMagick 7 (`magick`) is not installed; it is what writes the PDF")
+    if not pages:
+        raise ComposeFailed("the book has no pages")
+    missing = [p for p in pages if not p.exists()]
+    if missing:
+        raise ComposeFailed(f"page {missing[0].name} was not drawn")
+    started = time.time()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    args = [magick, "-limit", "memory", memory_limit, "-limit", "map", "1GiB",
+            "-units", "PixelsPerInch", "-density", str(dpi)]
+    args += [str(p) for p in pages]
+    args += ["-quality", "92", str(out_path)]
+    run = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if run.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        detail = ((run.stderr or "").strip().splitlines()[-1:] or [""])[0]
+        raise ComposeFailed(f"the PDF could not be written: {detail[:300]}")
+    return {"path": str(out_path), "pages": len(pages), "dpi": dpi,
+            "bytes": out_path.stat().st_size, "seconds": round(time.time() - started, 1)}
+
+
+def add_caption(magick: str, path: Path, text: str, page_width: int, band: int,
+                background: str, timeout: int = 300) -> None:
+    """Write the caption into the strip the layout already left for it.
+
+    Its own run of ImageMagick on purpose: `-gravity` is a setting, and one left
+    in force during the compositing loop moves every photograph on the page.
+    """
+    point = max(10, round(band * 0.42))
+    dark = background.lower() in ("black", "#000", "#000000", "none")
+    run = subprocess.run(
+        [magick, str(path), "-gravity", "South",
+         "-fill", "white" if dark else "#333333",
+         "-pointsize", str(point), "-annotate", f"+0+{round(band * 0.28)}", text,
+         str(path)],
+        capture_output=True, text=True, timeout=timeout)
+    if run.returncode != 0:
+        raise ComposeFailed("the caption could not be drawn: "
+                            + ((run.stderr or "").strip().splitlines()[-1:] or [""])[0][:200])
 
 
 def image_size(path: Path) -> tuple[int, int]:
