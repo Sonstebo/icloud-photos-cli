@@ -122,10 +122,11 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `people [--all]` | people from iCloud's People album, with photos found per person | no |
 | `index [--limit N] [--seed] [--rematch] [--threshold T] [--fetch-models] [--background]` | CLIP embeddings and faces | yes |
 | `refresh [--no-index] [--index-limit N]` | sync, index what is new, update the GUI library | yes |
+| `edit ID PROMPT [--out DIR] [--timeout N]` | ask an agent to change a photo; the result is a new file on disk | yes |
 | `lap-export [--library P] [--root P] [--limit N] [--fetch-thumbs] [--open-version V]` | write the catalogue into the GUI's library | only with `--fetch-thumbs` |
 | `lap-fetch PATH` | fetch the file behind one GUI entry (the app's fetch-on-open command) | yes |
 | `faces show\|assign\|unassign\|unassigned` | faces in photos; name or clear one | no |
-| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version` | no |
+| `config show\|set KEY VALUE` | `cache_budget_mb`, `username`, `preview_size`, `face_threshold`, `compute`, `lap_open_version`, `edits_dir`, `edit_agent`, `edit_timeout_s` | no |
 
 Dates accept `2019`, `2019-07`, `2019-07-20` or full ISO 8601; `--until`
 includes the whole of the period given. Exit codes: 1 error, 2 needs a
@@ -225,6 +226,26 @@ Pass 1 uses thumbnails (about 480 px wide), which is enough for the
 embedding and for faces that fill a fair part of the frame. Small faces in
 group shots need the medium rendition; the index records the source of each
 result so a later pass can redo those. Movies are not indexed yet.
+
+## Editing a photo by asking
+
+```sh
+photos edit <id or album entry> "warmer light and a little more contrast"
+```
+
+The original is fetched, handed to [Codex](https://developers.openai.com/codex/cli)
+(OpenAI's agent CLI, which signs in with a ChatGPT subscription), and edited with
+the tools on this machine: ImageMagick and ffmpeg. The result is a new file in
+`~/Pictures/Photos Edits/<date>/`, an ordinary folder you can browse, back up or
+delete without this tool. Nothing is written to iCloud and the original is never
+touched.
+
+This is ordinary photo work: exposure, contrast, colour, crop, rotate, resize,
+sharpen, borders, text, format conversion. It cannot invent content, so
+"remove the car" is refused rather than faked; that needs an image model, which
+is a metered service and not part of a ChatGPT subscription. `config set
+edits_dir`, `edit_agent` and `edit_timeout_s` change where results go, which
+agent is asked, and how long it may take.
 
 ## What the GUI does not do
 

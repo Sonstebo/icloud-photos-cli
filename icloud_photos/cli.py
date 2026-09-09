@@ -27,6 +27,7 @@ from .paths import DEFAULTS, Config, Paths
 from .sync import sync as run_sync
 from . import index as indexing
 from . import lap as lap_export
+from . import edit as editing
 from .ml import COMPUTE_MODES, ComputeUnavailable, ModelsMissing, OnnxModels, as_blob, fetch_clip_models, from_blob
 
 EXT_BY_TYPE = {
@@ -348,6 +349,38 @@ def cmd_lap_export(app: App, args: argparse.Namespace) -> int:
     app.emit(result, lambda r: f"lap library {r['library']}: {r['files']} files ({r['linked']} with a cached file), "
                                f"{r['thumbs']} thumbnails, {r['embeddings']} embeddings, {r['faces']} faces of {r['people']} people, "
                                f"{r['collections']} collections; restart lap to see them")
+    return 0
+
+
+def cmd_edit(app: App, args: argparse.Namespace) -> int:
+    """Ask the agent to change one photo; the result is a new file on disk."""
+    target = Path(args.id)
+    if target.exists() or "@" in target.name:          # an entry in the GUI album
+        asset_id = lap_export.asset_id_of(target.name)
+        row = app.catalog.db.execute("SELECT id FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if row is None:
+            row = next((r for r in app.catalog.db.execute("SELECT id FROM assets")
+                        if lap_export.safe_name(r["id"]) == asset_id), None)
+        if row is None:
+            raise CliError("no-such-asset", f"{target.name} names no asset in the catalogue")
+        asset = _assets(app, [row["id"]])[0]
+    else:
+        asset = _assets(app, [args.id])[0]
+    version = "original" if "original" in asset["versions"] else next(iter(asset["versions"]), "")
+    if not version:
+        raise CliError("no-such-version", f"{asset['id']} has no rendition to edit")
+    fetched = _fetch(app, asset, version)
+    try:
+        result = editing.edit(Path(fetched["path"]), args.prompt,
+                              name=asset.get("filename") or asset["id"],
+                              root=Path(args.out) if args.out else editing.edits_dir(app.config.values.get("edits_dir")),
+                              agent=str(app.config.values.get("edit_agent", editing.DEFAULT_AGENT)),
+                              timeout=args.timeout or int(app.config.values.get("edit_timeout_s", editing.DEFAULT_TIMEOUT)),
+                              progress=lambda m: None if app.json else print(f"  {m}", file=sys.stderr))
+    except editing.EditFailed as err:
+        raise CliError("edit-failed", str(err)) from err
+    app.emit({"id": asset["id"]} | result,
+             lambda r: f"{r['id']}\t{r['path']}  ({r['seconds']}s, {human_bytes(r['bytes'])})")
     return 0
 
 
@@ -817,6 +850,19 @@ def build_parser() -> argparse.ArgumentParser:
                                    "and the file is not on disk.")
     s.add_argument("path", help="the entry's path under the album root")
     s.set_defaults(fn=cmd_lap_fetch)
+
+    s = sub.add_parser("edit", help="ask an agent to change a photo; the result is a new file on disk",
+                       description="Fetches the original and hands it to the Codex CLI, which signs in with a "
+                                   "ChatGPT subscription and edits the photo with the tools on this machine "
+                                   "(ImageMagick, ffmpeg). The result goes to <edits_dir>/<date>/, an ordinary "
+                                   "folder; nothing is written to iCloud and the original is untouched. Ordinary "
+                                   "photo work only: exposure, colour, crop, rotate, resize, borders, text. "
+                                   "Inventing content needs an image model, which this does not use.")
+    s.add_argument("id", help="asset id, or the path of an entry in the GUI album")
+    s.add_argument("prompt", help="what to change, in plain words")
+    s.add_argument("--out", help="where to put the result (config edits_dir, default ~/Pictures/Photos Edits)")
+    s.add_argument("--timeout", type=int, help="seconds to allow the agent (config edit_timeout_s, default 900)")
+    s.set_defaults(fn=cmd_edit)
 
     s = sub.add_parser("refresh", help="sync, index what is new, and update the GUI library",
                        description="One pass of everything that keeps the library current: an incremental sync, an "

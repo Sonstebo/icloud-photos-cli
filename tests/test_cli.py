@@ -735,3 +735,55 @@ class InternalErrorTests(unittest.TestCase):
             self.assertEqual(payload["error"], "internal-error")
             self.assertIn("RuntimeError: models exploded", payload["message"])
             self.assertNotIn("Traceback", err.getvalue())
+
+
+class EditTests(unittest.TestCase):
+    """`edit` hands the photo to an agent; the agent itself is stubbed here."""
+
+    def test_slug_and_naming(self):
+        from icloud_photos import edit as editing
+        self.assertEqual(editing.slugify("Make it black & white!"), "make-it-black-white")
+        self.assertEqual(editing.slugify(""), "edit")
+        self.assertEqual(editing.slugify("a" * 80), "a" * 40)
+
+    def test_edit_runs_the_agent_and_files_the_result(self):
+        import shutil, tempfile
+        from unittest import mock
+        from icloud_photos import edit as editing
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            src = tmp / "IMG_1.jpg"
+            src.write_bytes(b"original")
+            fake_agent = tmp / "agent"
+            fake_agent.write_text("#!/bin/sh\nd=$(echo \"$@\" | tr ' ' '\\n' | grep -A0 '^/.*input' | head -1)\n"
+                                  "dir=$(dirname \"$d\")\nprintf edited > \"$dir/output.jpg\"\necho 'RESULT: output.jpg'\n")
+            fake_agent.chmod(0o755)
+            with mock.patch.object(editing, "is_image", lambda p: p.exists() and p.stat().st_size > 0):
+                r = editing.edit(src, "Make It Grey", root=tmp / "edits", agent=str(fake_agent))
+            out = Path(r["path"])
+            self.assertTrue(out.exists())
+            self.assertEqual(out.read_bytes(), b"edited")
+            self.assertEqual(out.parent.parent, tmp / "edits")
+            self.assertTrue(out.name.startswith("IMG_1-make-it-grey"))
+            self.assertEqual(src.read_bytes(), b"original", "the original must not be touched")
+            self.assertFalse((tmp / "edits" / ".work").exists() and any((tmp / "edits" / ".work").iterdir()))
+
+    def test_a_silent_agent_is_an_error_not_a_broken_file(self):
+        import tempfile
+        from icloud_photos import edit as editing
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            src = tmp / "IMG_2.jpg"; src.write_bytes(b"x")
+            quiet = tmp / "quiet"; quiet.write_text("#!/bin/sh\necho 'CANNOT: I cannot invent content'\n"); quiet.chmod(0o755)
+            with self.assertRaises(editing.EditFailed) as ctx:
+                editing.edit(src, "remove the car", root=tmp / "edits", agent=str(quiet))
+            self.assertIn("cannot invent", str(ctx.exception).lower())
+
+    def test_a_missing_agent_says_so(self):
+        import tempfile
+        from icloud_photos import edit as editing
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "a.jpg"; src.write_bytes(b"x")
+            with self.assertRaises(editing.EditFailed) as ctx:
+                editing.edit(src, "x", root=Path(tmp), agent="no-such-agent-binary")
+            self.assertIn("not installed", str(ctx.exception))
