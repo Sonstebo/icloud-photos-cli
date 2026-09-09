@@ -787,3 +787,210 @@ class EditTests(unittest.TestCase):
             with self.assertRaises(editing.EditFailed) as ctx:
                 editing.edit(src, "x", root=Path(tmp), agent="no-such-agent-binary")
             self.assertIn("not installed", str(ctx.exception))
+
+
+# --- choosing a handful out of thousands ------------------------------------
+
+def svec(*coords: float) -> bytes:
+    """A 512-d unit vector whose first coordinates are given, so cosines are exact."""
+    v = np.zeros(512, dtype=np.float32)
+    for i, c in enumerate(coords):
+        v[i] = c
+    n = float(np.linalg.norm(v))
+    return (v / n).astype(np.float32).tobytes()
+
+
+class FakeCatalog:
+    """Just the handful of methods the funnel asks for."""
+
+    def __init__(self, rows, vecs=None, people=None):
+        self.rows = rows
+        self.vecs = vecs or {}
+        self.people = people or {}
+
+    def counts(self):
+        return {"assets": len(self.rows)}
+
+    def _matching(self, ids=None, favorite=None, **_ignored):
+        out = list(self.rows)
+        if ids is not None:
+            keep = set(ids)
+            out = [a for a in out if a["id"] in keep]
+        if favorite is not None:
+            out = [a for a in out if bool(a.get("favorite")) == favorite]
+        return out
+
+    def count_assets(self, **filters):
+        return len(self._matching(**filters))
+
+    def search(self, limit=50, **filters):
+        rows = self._matching(**filters)
+        rows.sort(key=lambda a: a.get("taken") or "", reverse=True)
+        return [dict(a) for a in rows[:limit]], None
+
+    def nearest_clip(self, embedding, limit):
+        q = np.frombuffer(embedding, dtype=np.float32)
+        out = []
+        for aid, blob in self.vecs.items():
+            v = np.frombuffer(blob, dtype=np.float32)
+            cos = float(np.dot(q, v))
+            out.append((aid, float(np.sqrt(max(0.0, 2 - 2 * cos)))))   # cosine -> L2 on unit vectors
+        out.sort(key=lambda t: t[1])
+        return out[:limit]
+
+    def clip_of(self, asset_id):
+        return self.vecs.get(asset_id)
+
+    def faces_of(self, asset_id):
+        return [{"person_id": p} for p in self.people.get(asset_id, [])]
+
+
+def srow(n, taken, **over):
+    base = dict(id=f"S{n}", filename=f"IMG_{n}.HEIC", kind="image", taken=taken,
+                favorite=False, width=4032, height=3024)
+    base.update(over)
+    return base
+
+
+class SelectFunnelTests(unittest.TestCase):
+    """The algorithm itself, with no catalogue, no models and no network."""
+
+    def setUp(self):
+        from icloud_photos import select
+        self.sel = select
+
+    def test_a_burst_collapses_to_one_frame_but_a_different_scene_does_not(self):
+        rows = [srow(1, "2024-05-01T10:00:00"), srow(2, "2024-05-01T10:00:30"),
+                srow(3, "2024-05-01T10:00:45"), srow(4, "2024-05-01T10:01:00")]
+        vecs = {"S1": svec(1, 0), "S2": svec(0.999, 0.045),       # cosine 0.999: the same picture
+                "S3": svec(0.99, 0.141),                           # cosine 0.99: still the same
+                "S4": svec(0, 1)}                                  # cosine 0: a different scene
+        unit = {k: np.frombuffer(v, dtype=np.float32) for k, v in vecs.items()}
+        kept, removed = self.sel._collapse_duplicates(rows, unit, lambda a: 0.5)
+        self.assertEqual((removed, sorted(a["id"] for a in kept)), (2, ["S1", "S4"]))
+
+    def test_looking_alike_is_not_enough_without_being_close_in_time(self):
+        rows = [srow(1, "2024-05-01T10:00:00"), srow(2, "2024-08-14T16:00:00")]
+        unit = {"S1": np.frombuffer(svec(1, 0), dtype=np.float32),
+                "S2": np.frombuffer(svec(0.999, 0.045), dtype=np.float32)}
+        kept, removed = self.sel._collapse_duplicates(rows, unit, lambda a: 0.5)
+        self.assertEqual((removed, len(kept)), (0, 2))
+
+    def test_the_best_frame_of_a_burst_is_the_one_that_survives(self):
+        rows = [srow(1, "2024-05-01T10:00:00"), srow(2, "2024-05-01T10:00:20", favorite=True)]
+        unit = {"S1": np.frombuffer(svec(1, 0), dtype=np.float32),
+                "S2": np.frombuffer(svec(0.999, 0.045), dtype=np.float32)}
+        quality = {"S1": 0.4, "S2": 0.9}
+        kept, removed = self.sel._collapse_duplicates(rows, unit, lambda a: quality[a["id"]])
+        self.assertEqual((removed, kept[0]["id"]), (1, "S2"))
+
+    def test_your_own_favourite_outranks_a_crisper_photo_nobody_marked(self):
+        favourite_but_soft = self.sel.quality({"favorite": True}, 12.0)
+        crisp_but_unmarked = self.sel.quality({"favorite": False}, 4000.0)
+        self.assertGreater(favourite_but_soft, crisp_but_unmarked)
+
+    def test_variety_at_zero_takes_the_top_ranked_and_at_one_spreads_out(self):
+        rows = [srow(i, f"2024-05-0{i}T10:00:00") for i in range(1, 5)]
+        unit = {"S1": np.frombuffer(svec(1, 0), dtype=np.float32),
+                "S2": np.frombuffer(svec(0.999, 0.045), dtype=np.float32),   # nearly S1
+                "S3": np.frombuffer(svec(0.99, 0.141), dtype=np.float32),    # nearly S1
+                "S4": np.frombuffer(svec(0, 1), dtype=np.float32)}           # unlike all of them
+        rel = {"S1": 0.99, "S2": 0.98, "S3": 0.97, "S4": 0.10}
+        tight = [a["id"] for a in self.sel._mmr(rows, unit, rel, 2, 0.0, "none")]
+        wide = [a["id"] for a in self.sel._mmr(rows, unit, rel, 2, 1.0, "none")]
+        self.assertEqual(tight, ["S1", "S2"])          # the two best matches, near-identical
+        self.assertEqual(wide, ["S1", "S4"])           # the two least alike
+
+    def test_spreading_over_days_avoids_taking_them_all_from_one_afternoon(self):
+        rows = ([srow(i, f"2024-05-01T1{i}:00:00") for i in range(1, 5)] +
+                [srow(9, "2024-06-20T10:00:00")])
+        unit = {a["id"]: np.frombuffer(svec(1, 0.01 * i), dtype=np.float32)
+                for i, a in enumerate(rows)}
+        rel = {"S1": .99, "S2": .98, "S3": .97, "S4": .96, "S9": .50}
+        crowded = [a["id"] for a in self.sel._mmr(rows, unit, rel, 2, 0.0, "none")]
+        spread = [a["id"] for a in self.sel._mmr(rows, unit, rel, 2, 0.0, "day")]
+        self.assertEqual(crowded, ["S1", "S2"])        # both from the first of May
+        self.assertEqual(spread, ["S1", "S9"])         # one from each day
+
+    def test_everyone_asked_for_appears_even_when_the_ranking_left_them_out(self):
+        rows = [srow(1, "2024-05-01T10:00:00"), srow(2, "2024-05-02T10:00:00"),
+                srow(3, "2024-05-03T10:00:00")]
+        who = {"S1": {"thea"}, "S2": {"thea"}, "S3": {"morfar"}}
+        picked = [rows[0], rows[1]]
+        rel = {"S1": .9, "S2": .8, "S3": .1}
+        out, missing = self.sel._ensure_everyone(
+            picked, rows, lambda i: who[i], ["thea", "morfar"], rel)
+        self.assertEqual(missing, [])
+        names = {p for a in out for p in who[a["id"]]}
+        self.assertEqual(names, {"thea", "morfar"})
+
+    def test_a_person_with_no_photo_at_all_is_reported_not_invented(self):
+        rows = [srow(1, "2024-05-01T10:00:00")]
+        out, missing = self.sel._ensure_everyone(
+            list(rows), rows, lambda i: {"thea"}, ["thea", "nobody"], {"S1": .9})
+        self.assertEqual((missing, len(out)), (["nobody"], 1))
+
+    def test_the_funnel_reports_every_stage_and_narrows_to_what_was_asked(self):
+        rows = [srow(i, f"2024-05-{i:02d}T10:00:00") for i in range(1, 13)]
+        vecs = {f"S{i}": svec(1, 0.02 * i) for i in range(1, 13)}
+        cat = FakeCatalog(rows, vecs)
+        got = self.sel.run(cat, count=4, filters={}, thumb_for=None)
+        self.assertEqual(len(got.picked), 4)
+        self.assertEqual([s.name for s in got.stages],
+                         ["library", "filters", "pool", "near-duplicates", "variety and quotas"])
+        self.assertEqual(got.stages[0].kept, 12)
+        self.assertIsNone(got.reason)
+
+    def test_filters_that_match_nothing_explain_themselves_rather_than_failing(self):
+        cat = FakeCatalog([srow(1, "2024-05-01T10:00:00")])
+        got = self.sel.run(cat, count=4, filters={"favorite": True})
+        self.assertEqual(got.picked, [])
+        self.assertIn("no photo matched the filters", got.reason)
+        self.assertEqual([s.name for s in got.stages], ["library", "filters"])
+
+    def test_a_description_ranks_the_whole_library_before_the_filters_narrow_it(self):
+        # The wanted photo is the oldest, so a pool of "the newest few" would miss it.
+        rows = [srow(i, f"2024-05-{i:02d}T10:00:00") for i in range(1, 9)]
+        vecs = {f"S{i}": svec(0, 1) for i in range(2, 9)}
+        vecs["S1"] = svec(1, 0)
+        cat = FakeCatalog(rows, vecs)
+        got = self.sel.run(cat, query="the one", count=1, filters={},
+                           embed=lambda _t: svec(1, 0))
+        self.assertEqual([a["id"] for a in got.picked], ["S1"])
+        self.assertIn("meaning", [s.name for s in got.stages])
+
+    def test_a_description_nothing_reaches_is_reported_with_the_floor_that_stopped_it(self):
+        rows = [srow(1, "2024-05-01T10:00:00")]
+        cat = FakeCatalog(rows, {"S1": svec(0, 1)})
+        got = self.sel.run(cat, query="nothing like it", count=3, filters={},
+                           controls=self.sel.Controls(floor=0.9), embed=lambda _t: svec(1, 0))
+        self.assertEqual(got.picked, [])
+        self.assertIn("lower --floor", got.reason)
+
+
+class SelectCliTests(CliTest):
+    def test_select_narrows_the_library_and_can_fill_a_collection_in_order(self):
+        self.j("sync")
+        r, _ = self.j("select", "--count", "3")
+        self.assertEqual(r["count"], 3)
+        self.assertEqual([s["stage"] for s in r["stages"]][:2], ["library", "filters"])
+        self.assertEqual(r["stages"][0]["kept"], 8)          # 7 images and one movie
+        self.assertEqual(r["stages"][1]["kept"], 7)          # --kind defaults to image
+
+        r, _ = self.j("select", "--count", "2", "--into", "Book")
+        self.assertEqual(r["collection"], {"name": "Book", "added": 2})
+        shown, _ = self.j("collection", "show", "Book")
+        self.assertEqual([a["id"] for a in shown["items"]], [a["id"] for a in r["selected"]])
+
+        # --replace empties it first, so the collection is the last answer, not every answer
+        r2, _ = self.j("select", "--count", "1", "--into", "Book", "--replace")
+        shown2, _ = self.j("collection", "show", "Book")
+        self.assertEqual(shown2["count"], 1)
+        self.assertEqual([a["id"] for a in shown2["items"]], [a["id"] for a in r2["selected"]])
+
+    def test_select_on_favourites_only_reports_the_true_number_matched(self):
+        self.j("sync")
+        r, _ = self.j("select", "--favorite", "--count", "5")
+        self.assertEqual(r["stages"][1]["kept"], 1)          # A003 is the only favourite
+        self.assertEqual(r["count"], 1)
+        self.assertIn("only 1 photos survived", r["reason"])

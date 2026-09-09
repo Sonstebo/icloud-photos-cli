@@ -114,6 +114,7 @@ systemctl --user enable --now icloud-photos-sync.timer   # hourly, incremental
 | `sync [--full] [--background]` | update the catalogue: assets, albums, people, face crops | yes |
 | `albums` | albums in the catalogue with counts | no |
 | `search [TEXT] [--semantic] [--similar ID] [--person P] [--since D] [--until D] [--kind image\|movie] [--favorite] [--album A] [--collection C] [--located] [--live] [--limit N] [--cursor C]` | paged search, newest first; ranked by score with `--semantic` or `--similar` | no |
+| `select [QUERY] [--count N] [--variety 0..1] [--spread none\|day\|month] [--everyone] [--sharp-only] [--keep-duplicates] [--floor S] [--person P] [--since D] [--until D] [--album A] [--collection C] [--favorite] [--located] [--into COLLECTION] [--replace]` | choose a handful of good photos out of thousands; reports every stage of the funnel | no |
 | `info ID...` | every field, cached renditions, albums, collections | no |
 | `show ID... [--size thumb\|medium]` | fetch previews, print `id<TAB>path` | if not cached |
 | `original ID... [--pin] [--version V]` | fetch full files, print paths | if not cached |
@@ -226,6 +227,36 @@ Pass 1 uses thumbnails (about 480 px wide), which is enough for the
 embedding and for faces that fill a fair part of the frame. Small faces in
 group shots need the medium rendition; the index records the source of each
 result so a later pass can redo those. Movies are not indexed yet.
+
+## Choosing a handful out of thousands
+
+Ranking by similarity to a description gives you nine frames of one moment,
+which is why automatic selection usually disappoints. `photos select` is a
+funnel instead, and every stage says what it removed:
+
+```
+$ photos select "children playing outdoors in summer" --count 8 --spread day
+ 33,161  library              everything in the catalogue
+ 30,100  filters              dates, people, album, place
+    240  meaning              nearest 1,440 to 'children playing outdoors...', then filtered
+    153  near-duplicates      87 collapsed into their best frame
+      8  variety and quotas   variety 0.45, spread by day
+```
+
+The last stage picks greedily: each time it takes the photo that is most
+relevant *minus* how much it resembles what has already been chosen. `--variety`
+sets that trade-off, from 0 for the tightest match to 1 for the widest spread.
+
+Two photos count as the same picture only when they look alike **and** were
+taken within ninety seconds, so a burst collapses to its best frame while the
+same wall photographed a year apart does not. The keeper is decided by focus,
+except that anything you marked as a favourite outranks any measurement.
+
+`--spread day` stops a week's trip coming out as one Tuesday afternoon.
+`--person` may be repeated to pool several people, and `--everyone` then
+guarantees each of them appears at least once, reporting anyone it could not
+place rather than quietly leaving them out. Nothing here touches the network,
+and `--into` writes the result to a collection in order.
 
 ## Editing a photo by asking
 

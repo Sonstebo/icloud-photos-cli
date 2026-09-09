@@ -696,6 +696,59 @@ def cmd_search(app: App, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_select(app: App, args: argparse.Namespace) -> int:
+    """Choose a handful of good photos: the funnel in `select.py`, wired to the catalogue."""
+    from . import select as selector
+
+    people = [_person_id(app, k) for k in (args.person or [])]
+    fav = True if args.favorite else None
+    filters = dict(
+        since=parse_date(args.since), until=parse_date(args.until, end=True),
+        kind=args.kind or "image", favorite=fav, album=args.album, collection=args.collection,
+        people=people or None, located=True if args.located else None)
+    controls = selector.Controls(
+        variety=args.variety, spread=args.spread, everyone=args.everyone,
+        sharp_only=args.sharp_only, duplicates=args.keep_duplicates, floor=args.floor)
+
+    embed = None
+    if args.query:
+        if not app.catalog.vec:
+            raise CliError("no-vector-search", "sqlite-vec is not available, so there is no ranking by meaning")
+
+        def embed(text: str) -> bytes:                                  # noqa: F811
+            try:
+                return as_blob(app.models.embed_text(text))
+            except ModelsMissing as err:
+                raise CliError("models-missing", str(err), 5) from err
+
+    result = selector.run(
+        app.catalog, query=args.query, count=args.count, filters=filters, controls=controls,
+        embed=embed, thumb_for=lambda aid: app.cache.peek(aid, "thumb"),
+        people_required=people if args.everyone else ())
+
+    payload = result.as_dict()
+    if args.into and result.picked:
+        app.catalog.collection_create(args.into)
+        if args.replace:
+            app.catalog.collection_remove(
+                args.into, [r["id"] for r in app.catalog.collection_items(args.into)])
+        added = app.catalog.collection_add(args.into, [a["id"] for a in result.picked])
+        payload["collection"] = {"name": args.into, "added": added}
+
+    def text(pl: dict[str, Any]) -> str:
+        lines = [f"{s['kept']:>7,}  {s['stage']:<20} {s['note']}" for s in pl["stages"]]
+        lines.append("")
+        lines += [f"{a['score']:.3f}  " + asset_line(a) for a in pl["selected"]] or ["nothing selected"]
+        if pl.get("collection"):
+            lines.append(f"added {pl['collection']['added']} to collection {pl['collection']['name']!r}")
+        if pl.get("reason"):
+            lines.append(f"note: {pl['reason']}")
+        return "\n".join(lines)
+
+    app.emit(payload, text)
+    return 0
+
+
 def _assets(app: App, ids: list[str]) -> list[dict[str, Any]]:
     out = []
     for asset_id in ids:
@@ -998,6 +1051,34 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=50, metavar="N", help="page size (default 50)")
     s.add_argument("--cursor", help="continue from a previous page")
     s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("select", help="choose a handful of good photos out of thousands",
+                       description="A funnel, not a ranking: filters, then meaning, then "
+                                   "near-duplicates collapsed, then quality, then variety and "
+                                   "quotas. Every stage reports what it removed, so an empty "
+                                   "result can be explained. Images only unless --kind says otherwise.")
+    s.add_argument("query", nargs="?", help="describe the picture you want (ranked by CLIP)")
+    s.add_argument("--count", type=int, default=9, metavar="N", help="how many to choose (default 9)")
+    s.add_argument("--since", metavar="DATE"); s.add_argument("--until", metavar="DATE")
+    s.add_argument("--kind", choices=("image", "movie"))
+    s.add_argument("--album", metavar="NAME_OR_ID"); s.add_argument("--collection", metavar="NAME")
+    s.add_argument("--person", metavar="NAME_OR_ID", action="append",
+                   help="only photos with this person; repeat for several (any of them)")
+    s.add_argument("--favorite", action="store_true"); s.add_argument("--located", action="store_true")
+    s.add_argument("--variety", type=float, default=0.45, metavar="0..1",
+                   help="0 is the closest match to the query, 1 is the widest spread (default 0.45)")
+    s.add_argument("--spread", choices=("none", "day", "month"), default="none",
+                   help="don't take them all from one afternoon")
+    s.add_argument("--everyone", action="store_true",
+                   help="every person named with --person appears at least once")
+    s.add_argument("--sharp-only", action="store_true", help="drop soft frames")
+    s.add_argument("--keep-duplicates", action="store_true",
+                   help="keep near-duplicates instead of collapsing each burst to its best frame")
+    s.add_argument("--floor", type=float, default=0.0, metavar="SCORE",
+                   help="minimum meaning score to survive (default 0)")
+    s.add_argument("--into", metavar="COLLECTION", help="add the chosen photos to this collection, in order")
+    s.add_argument("--replace", action="store_true", help="with --into, empty the collection first")
+    s.set_defaults(fn=cmd_select)
 
     s = sub.add_parser("info", help="everything known about one or more assets")
     s.add_argument("id", nargs="+")

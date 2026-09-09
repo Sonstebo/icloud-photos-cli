@@ -304,27 +304,16 @@ class Catalog:
             "people": q("SELECT COUNT(*) FROM people WHERE deleted=0").fetchone()[0],
         }
 
-    def search(
-        self,
-        *,
-        text: str | None = None,
-        since: str | None = None,
-        until: str | None = None,
-        kind: str | None = None,
-        favorite: bool | None = None,
-        album: str | None = None,
-        collection: str | None = None,
-        person: str | None = None,
-        ids: list[str] | None = None,
-        located: bool | None = None,
-        live: bool | None = None,
-        include_missing: bool = False,
-        include_hidden: bool = False,
-        limit: int = 50,
-        cursor: str | None = None,
-    ) -> tuple[list[dict[str, Any]], str | None]:
-        """Keyset-paged search, newest capture first. Returns (rows, next_cursor)."""
-        where, args = [], []
+    def _filters(
+        self, *, text: str | None = None, since: str | None = None, until: str | None = None,
+        kind: str | None = None, favorite: bool | None = None, album: str | None = None,
+        collection: str | None = None, person: str | None = None, people: list[str] | None = None,
+        ids: list[str] | None = None, located: bool | None = None, live: bool | None = None,
+        include_missing: bool = False, include_hidden: bool = False,
+    ) -> tuple[list[str], list[Any]]:
+        """The WHERE shared by `search` and `count_assets`, so the two can never disagree."""
+        where: list[str] = []
+        args: list[Any] = []
         if not include_missing:
             where.append("a.missing_since IS NULL")
         if not include_hidden:
@@ -355,9 +344,50 @@ class Catalog:
         if person:
             where.append("a.id IN (SELECT asset_id FROM faces WHERE person_id = ?)")
             args.append(person)
+        if people:
+            # any of them, so "the kids" is one pool; requiring each to appear is a
+            # quota on the selection, not a filter on the library.
+            where.append("a.id IN (SELECT asset_id FROM faces WHERE person_id IN "
+                         f"({','.join('?' * len(people))}))")
+            args += list(people)
         if ids is not None:
             where.append(f"a.id IN ({','.join('?' * len(ids))})" if ids else "0")
             args += ids
+        return where, args
+
+    def count_assets(self, **filters: Any) -> int:
+        """How many assets these filters match, ignoring paging."""
+        where, args = self._filters(**filters)
+        sql = "SELECT COUNT(*) FROM assets a"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return int(self.db.execute(sql, args).fetchone()[0])
+
+    def search(
+        self,
+        *,
+        text: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        kind: str | None = None,
+        favorite: bool | None = None,
+        album: str | None = None,
+        collection: str | None = None,
+        person: str | None = None,
+        people: list[str] | None = None,
+        ids: list[str] | None = None,
+        located: bool | None = None,
+        live: bool | None = None,
+        include_missing: bool = False,
+        include_hidden: bool = False,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Keyset-paged search, newest capture first. Returns (rows, next_cursor)."""
+        where, args = self._filters(
+            text=text, since=since, until=until, kind=kind, favorite=favorite, album=album,
+            collection=collection, person=person, people=people, ids=ids, located=located,
+            live=live, include_missing=include_missing, include_hidden=include_hidden)
         if cursor:
             taken, asset_id = decode_cursor(cursor)
             # rows sort by (taken DESC, id DESC); NULL taken sorts last in DESC order
