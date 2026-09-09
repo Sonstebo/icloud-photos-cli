@@ -12,11 +12,19 @@ folder (default `~/Pictures/Photos Edits`) that can be browsed, backed up or
 deleted without this tool. Each edit runs in a scratch directory under
 `<edits_dir>/.work` that is removed afterwards.
 
-What an agent with ImageMagick can do is ordinary photo work: exposure,
-contrast, colour, crop, rotate, resize, sharpen, blur, borders, text, format
-conversion. It cannot invent content, so "remove the car" or "make her smile"
-will fail or disappoint; that needs an image model, which is a different
-(metered) service.
+Two kinds of change are possible, and the agent picks between them:
+
+- **Adjustments** (exposure, contrast, colour, crop, rotate, resize, sharpen,
+  borders, text, format) are done with ImageMagick: exact, fast, and the full
+  resolution of the original is kept.
+- **Content changes** (removing an object, restoring and sharpening an old
+  photo, adding something that is not there) use the image tool the agent has
+  through the ChatGPT subscription. These are regenerated pixels, so the result
+  comes back at the image model's own size, usually smaller than the original,
+  and the detail is the model's interpretation rather than the camera's.
+
+The result records which route was taken and both sizes, so a drop in
+resolution is never a surprise.
 """
 
 from __future__ import annotations
@@ -43,14 +51,24 @@ Apply exactly this change, and only this change:
 
 {prompt}
 
+How to do it:
+- If the change is an adjustment of the existing pixels (exposure, contrast, colour,
+  white balance, crop, rotate, straighten, resize, sharpen, blur, borders, text,
+  format conversion), use `magick` (ImageMagick 7) or `ffmpeg`. This keeps the
+  original resolution, so prefer it whenever it can do the job.
+- If the change needs pixels that are not in the photo (removing or adding an
+  object, restoring or repairing an old or damaged photo, changing a background),
+  use your image generation tool with ./{input_name} as the input image. Keep the
+  same people, framing and proportions unless the request says otherwise.
+
 Rules:
-- Write the result as ./{output_name} in this directory.
+- Write the result as ./{output_name} in this directory (any common image format
+  is fine; name it output.png if the tool returns PNG).
 - Never modify or delete ./{input_name}, and never touch anything outside this directory.
-- Keep the original resolution and orientation unless the request asks otherwise.
-- Use the tools on this machine: `magick` (ImageMagick 7) and `ffmpeg`.
-- If the request needs content that is not in the photo (adding or removing objects,
-  changing faces), do not fake it: print `CANNOT: <one line why>` and write no file.
-- When the file is written, print `RESULT: {output_name}` as the last line.
+- If you genuinely cannot do it, print `CANNOT: <one line why>` and write no file.
+- When the file is written, print two lines and nothing after them:
+  `METHOD: magick` or `METHOD: generated`
+  `RESULT: <the file you wrote>`
 """
 
 
@@ -85,6 +103,15 @@ def is_image(path: Path) -> bool:
     return subprocess.run(args, capture_output=True, timeout=60).returncode == 0
 
 
+def dimensions(path: Path) -> str:
+    """`WIDTHxHEIGHT`, or an empty string if ImageMagick cannot say."""
+    magick = shutil.which("magick")
+    if magick is None:
+        return ""
+    out = subprocess.run([magick, "identify", "-format", "%wx%h", str(path)], capture_output=True, text=True, timeout=60)
+    return out.stdout.strip().splitlines()[0] if out.returncode == 0 and out.stdout.strip() else ""
+
+
 def edit(source: Path, prompt: str, *, name: str | None = None, root: Path | None = None,
          agent: str = DEFAULT_AGENT, timeout: int = DEFAULT_TIMEOUT,
          progress: Progress = lambda _: None) -> dict[str, Any]:
@@ -117,7 +144,9 @@ def edit(source: Path, prompt: str, *, name: str | None = None, root: Path | Non
 
     tail = (run.stdout or "").strip().splitlines()
     said = next((line for line in reversed(tail) if line.startswith(("RESULT:", "CANNOT:"))), "")
-    produced = work / output_name
+    method = next((line.split(":", 1)[1].strip() for line in reversed(tail) if line.startswith("METHOD:")), "")
+    named = said.split(":", 1)[1].strip() if said.startswith("RESULT:") else ""
+    produced = work / named if named and (work / named).exists() else work / output_name
     if not produced.exists():
         produced = next((p for p in sorted(work.iterdir())
                          if p.name != input_name and p.is_file() and is_image(p)), None) or produced
@@ -137,4 +166,6 @@ def edit(source: Path, prompt: str, *, name: str | None = None, root: Path | Non
     shutil.move(str(produced), target)
     shutil.rmtree(work, ignore_errors=True)
     return {"path": str(target), "bytes": target.stat().st_size, "prompt": prompt,
-            "source": str(source), "agent": agent, "seconds": round(time.time() - started, 1)}
+            "source": str(source), "agent": agent, "method": method or "unknown",
+            "size": dimensions(target), "source_size": dimensions(source),
+            "seconds": round(time.time() - started, 1)}

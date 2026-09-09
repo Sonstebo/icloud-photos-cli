@@ -380,7 +380,8 @@ def cmd_edit(app: App, args: argparse.Namespace) -> int:
     except editing.EditFailed as err:
         raise CliError("edit-failed", str(err)) from err
     app.emit({"id": asset["id"]} | result,
-             lambda r: f"{r['id']}\t{r['path']}  ({r['seconds']}s, {human_bytes(r['bytes'])})")
+             lambda r: f"{r['id']}\t{r['path']}\n  {r['method']}, {r['seconds']}s, {human_bytes(r['bytes'])}"
+                       + (f", {r['source_size']} -> {r['size']}" if r["size"] and r["size"] != r["source_size"] else ""))
     return 0
 
 

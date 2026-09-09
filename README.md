@@ -233,19 +233,23 @@ result so a later pass can redo those. Movies are not indexed yet.
 photos edit <id or album entry> "warmer light and a little more contrast"
 ```
 
-The original is fetched, handed to [Codex](https://developers.openai.com/codex/cli)
-(OpenAI's agent CLI, which signs in with a ChatGPT subscription), and edited with
-the tools on this machine: ImageMagick and ffmpeg. The result is a new file in
-`~/Pictures/Photos Edits/<date>/`, an ordinary folder you can browse, back up or
-delete without this tool. Nothing is written to iCloud and the original is never
-touched.
+The original is fetched and handed to [Codex](https://developers.openai.com/codex/cli),
+OpenAI's agent CLI, which signs in with a ChatGPT subscription. The result is a
+new file in `~/Pictures/Photos Edits/<date>/`, an ordinary folder you can browse,
+back up or delete without this tool. Nothing is written to iCloud and the
+original is never touched.
 
-This is ordinary photo work: exposure, contrast, colour, crop, rotate, resize,
-sharpen, borders, text, format conversion. It cannot invent content, so
-"remove the car" is refused rather than faked; that needs an image model, which
-is a metered service and not part of a ChatGPT subscription. `config set
-edits_dir`, `edit_agent` and `edit_timeout_s` change where results go, which
-agent is asked, and how long it may take.
+The agent picks one of two routes and says which it used:
+
+| Route | For | Cost |
+| --- | --- | --- |
+| `magick` | exposure, contrast, colour, crop, rotate, resize, sharpen, borders, text, format | seconds, exact, full resolution |
+| `generated` | removing or adding objects, restoring an old photo, changing a background | a minute or two, and the image model's own size (about 1024x1536), so a large original comes back smaller |
+
+Both are covered by the subscription. The output line reports the route and,
+when the size changed, both sizes. `config set edits_dir`, `edit_agent` and
+`edit_timeout_s` change where results go, which agent is asked, and how long it
+may take.
 
 ## What the GUI does not do
 
