@@ -472,13 +472,17 @@ def cmd_refresh(app: App, args: argparse.Namespace) -> int:
     """sync, index what is new, and update the GUI library: what the timer runs."""
     steps: dict[str, Any] = {}
     if (pid := _sync_pid(app)) is not None:
-        raise CliError("sync-running", f"a sync is already running (pid {pid}); see `photos status`")
-    app.paths.sync_lock.write_text(str(os.getpid()))
-    try:
-        result = run_sync(app.catalog, app.adapter, full=False)
-    finally:
-        app.paths.sync_lock.unlink(missing_ok=True)
-    steps["sync"] = {k: result[k] for k in ("mode", "records", "new", "changed", "missing") if k in result}
+        # The hourly timer must not fail merely because a long first sync of a
+        # shared library is still going: it would fail every hour until that
+        # finishes. Skip the step, the way an index run in progress is skipped.
+        steps["sync"] = {"skipped": f"a sync is already running (pid {pid})"}
+    else:
+        app.paths.sync_lock.write_text(str(os.getpid()))
+        try:
+            result = run_sync(app.catalog, app.adapter, full=False)
+        finally:
+            app.paths.sync_lock.unlink(missing_ok=True)
+        steps["sync"] = {k: result[k] for k in ("mode", "records", "new", "changed", "missing") if k in result}
     # Only load the models when there is something to index: they cost ~2 GB, and this
     # runs hourly on a machine that may be doing something else.
     todo = app.catalog.db.execute(

@@ -1782,3 +1782,16 @@ class PreflightCliTests(CliTest):
         self.j("book", "create", "Empty")
         _, err = self.j("book", "preflight", "Empty", expect=1)
         self.assertIn("empty-book", err)
+
+    def test_refresh_skips_a_sync_that_is_already_running_instead_of_failing(self):
+        self.j("sync")
+        app = cli.App(json_mode=True)
+        lock = app.paths.sync_lock
+        app.close()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(os.getpid()))          # a sync "in progress"
+        try:
+            r, _ = self.j("refresh", "--no-index")
+            self.assertIn("already running", r["sync"]["skipped"])
+        finally:
+            lock.unlink(missing_ok=True)
