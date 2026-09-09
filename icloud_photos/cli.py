@@ -708,7 +708,8 @@ def cmd_select(app: App, args: argparse.Namespace) -> int:
         people=people or None, located=True if args.located else None)
     controls = selector.Controls(
         variety=args.variety, spread=args.spread, everyone=args.everyone,
-        sharp_only=args.sharp_only, duplicates=args.keep_duplicates, floor=args.floor)
+        sharp_only=args.sharp_only, duplicates=args.keep_duplicates, floor=args.floor,
+        screenshots=args.include_screenshots)
 
     anchor = None
     if args.similar:
@@ -1294,13 +1295,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--favorite", action="store_true"); s.add_argument("--located", action="store_true")
     s.add_argument("--variety", type=float, default=0.45, metavar="0..1",
                    help="0 is the closest match to the query, 1 is the widest spread (default 0.45)")
-    s.add_argument("--spread", choices=("none", "day", "month"), default="none",
-                   help="don't take them all from one afternoon")
+    s.add_argument("--spread", choices=("none", "day", "month", "year"), default="none",
+                   help="don't take them all from one afternoon, month or year")
     s.add_argument("--everyone", action="store_true",
                    help="every person named with --person appears at least once")
     s.add_argument("--sharp-only", action="store_true", help="drop soft frames")
     s.add_argument("--keep-duplicates", action="store_true",
                    help="keep near-duplicates instead of collapsing each burst to its best frame")
+    s.add_argument("--include-screenshots", action="store_true",
+                   help="keep screen captures; they are set aside by default, since a PNG in a "
+                        "photo library is a screenshot rather than a photograph")
     s.add_argument("--floor", type=float, default=0.0, metavar="SCORE",
                    help="minimum meaning score to survive (default 0)")
     s.add_argument("--into", metavar="COLLECTION", help="add the chosen photos to this collection, in order")

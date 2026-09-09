@@ -54,10 +54,11 @@ class Controls:
     """The five switches, in the words the interface uses."""
 
     variety: float = 0.45            # 0 = closest match, 1 = widest spread
-    spread: str = "none"             # none | day | month: don't take them all from one afternoon
+    spread: str = "none"             # none | day | month | year: don't take them all from one afternoon
     everyone: bool = False           # every person asked for appears at least once
     sharp_only: bool = False         # drop soft frames
     duplicates: bool = False         # keep near-duplicates instead of collapsing them
+    screenshots: bool = False        # keep screen captures, which a photo book does not want
     floor: float = 0.0               # minimum meaning score, when there is a query
 
 
@@ -105,7 +106,7 @@ def _bucket(a: dict[str, Any], how: str) -> str:
     if not t:
         return "undated"
     s = str(t)
-    return s[:10] if how == "day" else s[:7] if how == "month" else "all"
+    return s[:4] if how == "year" else s[:7] if how == "month" else s[:10] if how == "day" else "all"
 
 
 def sharpness(path: Any) -> float | None:
@@ -220,6 +221,42 @@ def _ensure_everyone(picked: list[dict[str, Any]], pool: list[dict[str, Any]],
     return picked, missing
 
 
+def _pool(catalog: Any, filters: dict[str, Any], want: int, matched: int,
+          spread: str) -> tuple[list[dict[str, Any]], str]:
+    """The photographs to choose among when nothing has ranked them.
+
+    Taking the newest few hundred is wrong for the request this exists to serve:
+    asked for a life from a first birthday to an eighteenth, a pool of the newest
+    photographs can only answer with this year. So the pool is drawn across the
+    whole range instead, and when a spread is asked for, across its buckets.
+    """
+    if matched <= want:
+        rows, _ = catalog.search(limit=max(matched, 1), **filters)
+        return rows, f"all {matched:,}"
+
+    dated = catalog.asset_dates(**filters)
+    if spread != "none":
+        buckets: dict[str, list[str]] = {}
+        for asset_id, taken in dated:
+            buckets.setdefault(_bucket({"taken": taken}, spread), []).append(asset_id)
+        # round-robin, so a year with forty photographs cannot crowd out one with four
+        picked: list[str] = []
+        rounds = 0
+        while len(picked) < want and rounds < max((len(v) for v in buckets.values()), default=0):
+            for ids in buckets.values():
+                if rounds < len(ids) and len(picked) < want:
+                    picked.append(ids[rounds])
+            rounds += 1
+        note = f"{len(picked)} of {matched:,}, across {len(buckets)} {spread}s"
+    else:
+        step = len(dated) / float(want)
+        picked = [dated[min(int(i * step), len(dated) - 1)][0] for i in range(want)]
+        note = f"{len(picked)} of {matched:,}, spread over the whole range"
+
+    rows, _ = catalog.search(ids=picked, limit=max(len(picked), 1), **filters)
+    return rows, note
+
+
 def run(catalog: Any, *, query: str | None = None, query_vector: bytes | None = None, count: int = 9,
         filters: dict[str, Any] | None = None, controls: Controls | None = None,
         embed: Embedder | None = None, thumb_for: ThumbFor | None = None,
@@ -237,8 +274,17 @@ def run(catalog: Any, *, query: str | None = None, query_vector: bytes | None = 
 
     # 1. Filters. Plain database columns, so this is exact and cheap. Counted over the
     # whole library, not over the pool, or the funnel would report its own cap.
+    # A photo book wants photographs. Screen captures are excluded before anything
+    # else looks at them, and the funnel says how many that was.
+    if not controls.screenshots:
+        filters["screenshots"] = False
     matched = catalog.count_assets(**filters)
-    out.stages.append(Stage("filters", matched, "dates, people, album, place"))
+    note = "dates, people, album, place"
+    if not controls.screenshots:
+        with_captures = catalog.count_assets(**{**filters, "screenshots": None})
+        if with_captures > matched:
+            note += f"; {with_captures - matched:,} screen captures set aside"
+    out.stages.append(Stage("filters", matched, note))
     if not matched:
         out.reason = "no photo matched the filters; widen the dates or drop a filter"
         return out
@@ -267,9 +313,8 @@ def run(catalog: Any, *, query: str | None = None, query_vector: bytes | None = 
         near = repr(query) if query else "this photo"
         out.stages.append(Stage("meaning", len(rows), f"nearest {scan:,} to {near}, then filtered"))
     else:
-        rows, _ = catalog.search(limit=pool_size, **filters)
+        rows, note = _pool(catalog, filters, pool_size, matched, controls.spread)
         rel = {a["id"]: 0.5 for a in rows}
-        note = "newest first" if matched <= len(rows) else f"the {len(rows)} newest of {matched:,}"
         out.stages.append(Stage("pool", len(rows), note))
         if query:
             out.stages.append(Stage("meaning", len(rows), "skipped: no text embedder available"))

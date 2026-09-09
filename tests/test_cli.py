@@ -811,7 +811,7 @@ class FakeCatalog:
     def counts(self):
         return {"assets": len(self.rows)}
 
-    def _matching(self, ids=None, favorite=None, **_ignored):
+    def _matching(self, ids=None, favorite=None, screenshots=None, **_ignored):
         out = list(self.rows)
         if ids is not None:
             keep = set(ids)
@@ -822,6 +822,11 @@ class FakeCatalog:
 
     def count_assets(self, **filters):
         return len(self._matching(**filters))
+
+    def asset_dates(self, **filters):
+        rows = self._matching(**filters)
+        rows.sort(key=lambda a: a.get("taken") or "")
+        return [(a["id"], a.get("taken")) for a in rows]
 
     def search(self, limit=50, **filters):
         rows = self._matching(**filters)
@@ -1347,3 +1352,60 @@ class BookTests(CliTest):
         self.assertEqual(self.j("book", "list")[0], [])
         still, _ = self.j("collection", "show", "Trip")
         self.assertEqual(still["count"], 1)
+
+
+class SelectPoolAndCapturesTests(unittest.TestCase):
+    """The two things that made a life story come out as this year's screenshots."""
+
+    def setUp(self):
+        from icloud_photos import select
+        self.sel = select
+
+    def test_the_pool_spans_the_whole_range_not_the_newest_slice(self):
+        # eighteen years, and far more photos than the pool can hold
+        rows, vecs = [], {}
+        n = 0
+        for year in range(2008, 2026):
+            for i in range(60):
+                n += 1
+                rows.append(srow(n, f"{year}-06-{(i % 28) + 1:02d}T10:00:00"))
+                vecs[f"S{n}"] = svec(1, 0.001 * n)
+        cat = FakeCatalog(rows, vecs)
+        got = self.sel.run(cat, count=18, filters={},
+                           controls=self.sel.Controls(spread="year"))
+        years = {(a["taken"] or "")[:4] for a in got.picked}
+        self.assertEqual(len(got.picked), 18)
+        self.assertGreaterEqual(len(years), 15, f"a life story cannot be one year: {sorted(years)}")
+        self.assertIn("2008", years)
+        self.assertIn("2025", years)
+
+    def test_without_a_spread_the_pool_still_reaches_the_oldest_photos(self):
+        rows = [srow(i, f"{2008 + i // 40}-06-01T10:00:00") for i in range(1, 400)]
+        cat = FakeCatalog(rows, {f"S{i}": svec(1, 0.001 * i) for i in range(1, 400)})
+        got = self.sel.run(cat, count=4, filters={})
+        pool = next(s for s in got.stages if s.name == "pool")
+        self.assertIn("spread over the whole range", pool.note)
+
+
+class ScreenCaptureTests(CliTest):
+    def test_a_png_is_a_screenshot_and_is_set_aside_unless_asked_for(self):
+        self.cloud.assets["A002/x+y=="].filename = "IMG_0002.PNG"
+        self.cloud.assets["A004/x+y=="].filename = "Screenshot.png"
+        self.j("sync")
+
+        r, _ = self.j("select", "--count", "9")
+        names = [a["filename"] for a in r["selected"]]
+        self.assertNotIn("IMG_0002.PNG", names)
+        self.assertNotIn("Screenshot.png", names)
+        self.assertIn("2 screen captures set aside", r["stages"][1]["note"])
+
+        r, _ = self.j("select", "--count", "9", "--include-screenshots")
+        names = [a["filename"] for a in r["selected"]]
+        self.assertIn("IMG_0002.PNG", names)
+        self.assertNotIn("screen captures set aside", r["stages"][1]["note"])
+
+    def test_search_is_left_alone_because_it_is_not_choosing_for_a_book(self):
+        self.cloud.assets["A002/x+y=="].filename = "IMG_0002.PNG"
+        self.j("sync")
+        r, _ = self.j("search")
+        self.assertIn("IMG_0002.PNG", [a["filename"] for a in r["results"]])
